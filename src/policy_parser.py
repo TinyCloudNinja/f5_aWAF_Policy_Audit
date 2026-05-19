@@ -84,8 +84,23 @@ def _parse_general(root) -> Dict:
     gen = _find(root, "general")
     if gen is None:
         return {}
+
+    # F5 exports are inconsistent between dashed and underscored element names.
+    # The general section typically uses <enforcement-mode>, but some exports
+    # emit <enforcement_mode>. Read both and only fall back to "transparent"
+    # when neither is present. This prevents masking a blocking policy as
+    # transparent in reports.
+    em_raw = _text(gen, "enforcement-mode") or _text(gen, "enforcement_mode")
+    # Note: some exports spell this as <enforcement_mode> while others use
+    # <enforcement-mode>. Capture both to avoid silently defaulting to
+    # "transparent" when the underscore variant is present.
+    enforcement_mode = (
+        _text(gen, "enforcement-mode")
+        or _text(gen, "enforcement_mode")
+        or "transparent"
+    )
     return {
-        "enforcementMode":          _text(gen, "enforcement-mode", "transparent"),
+        "enforcementMode":          enforcement_mode,
         "signatureStaging":         _norm_bool(gen, "signature-staging"),
         "placeholderSignatures":    _norm_bool(gen, "placeholder-signatures"),
         "responseLogging":          _text(gen, "response-logging", "none"),
