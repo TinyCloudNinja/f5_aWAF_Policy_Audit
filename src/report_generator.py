@@ -210,6 +210,8 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
     )
 
     css = _DASHBOARD_CSS
+    legacy_sections = "".join(_build_legacy_policy_section(r) for r in ordered)
+
     html_doc = (
         "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
         f"<title>{'Bot Defense' if is_bot else 'WAF'} Audit Dashboard</title>"
@@ -224,6 +226,9 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
         "</tr></thead><tbody>"
         + "".join(rows) +
         "</tbody></table>"
+        "<h2 style='margin-top:24px'>Detailed Combined Report</h2>"
+        "<p class='muted'>Legacy per-policy report content is included below for full audit detail.</p>"
+        f"{legacy_sections}"
         "</body></html>"
     )
 
@@ -236,9 +241,75 @@ def _esc(val) -> str:
     return html.escape(str(val))
 
 
+def _build_legacy_policy_section(result: ComparisonResult) -> str:
+    """Render a legacy-style per-policy combined detail block."""
+    sev_order = [SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_WARNING, SEVERITY_INFO]
+    sev_labels = {
+        SEVERITY_CRITICAL: "Critical",
+        SEVERITY_HIGH: "High",
+        SEVERITY_WARNING: "Warning",
+        SEVERITY_INFO: "Informational",
+    }
+
+    summary_rows = ""
+    for sev in sev_order:
+        count = len([d for d in result.findings if d.severity == sev])
+        summary_rows += f"<tr><td>{sev_labels[sev]}</td><td>{count}</td></tr>"
+
+    finding_sections: List[str] = []
+    for sev in sev_order:
+        items = [d for d in result.findings if d.severity == sev]
+        if not items:
+            continue
+        rows = []
+        for diff in items:
+            rows.append(
+                "<tr>"
+                f"<td>{_esc(diff.section)}</td>"
+                f"<td>{_esc(diff.element_name)}</td>"
+                f"<td><code>{_esc(diff.attribute)}</code></td>"
+                f"<td>{_esc(human_bool(diff.baseline_value))}</td>"
+                f"<td>{_esc(human_bool(diff.target_value))}</td>"
+                f"<td>{_esc(diff.description)}</td>"
+                "</tr>"
+            )
+
+        finding_sections.append(
+            "<details>"
+            f"<summary>{sev_labels[sev]} Findings ({len(items)})</summary>"
+            "<div class='details-body'>"
+            "<table class='results legacy-findings'>"
+            "<thead><tr>"
+            "<th>Section</th><th>Element</th><th>Attribute</th><th>Baseline</th><th>Target</th><th>Description</th>"
+            "</tr></thead><tbody>"
+            + "".join(rows) +
+            "</tbody></table></div></details>"
+        )
+
+    raw_score = f"{result.raw_score:.1f}%" if result.is_hard_fail else "—"
+    cb_text = ", ".join(result.circuit_breakers_triggered) if result.circuit_breakers_triggered else "None"
+    return (
+        "<details class='legacy-policy'>"
+        f"<summary><strong>{_esc(result.policy_path)}</strong> — {_TIER_EMOJI.get(result.tier,'')} {_esc(result.tier_label)} ({result.score:.1f}%)</summary>"
+        "<div class='details-body'>"
+        "<table class='results legacy-meta'><tbody>"
+        f"<tr><th>Partition</th><td>{_esc(result.partition)}</td><th>Enforcement Mode</th><td>{_esc(result.enforcement_mode)}</td></tr>"
+        f"<tr><th>Baseline</th><td>{_esc(result.baseline_name)}</td><th>Audit Date</th><td>{_esc(result.timestamp)}</td></tr>"
+        f"<tr><th>Score</th><td>{result.score:.1f}%</td><th>Raw Score</th><td>{raw_score}</td></tr>"
+        f"<tr><th>Circuit Breakers</th><td colspan='3'>{_esc(cb_text)}</td></tr>"
+        "</tbody></table>"
+        "<h3>Executive Summary</h3>"
+        "<table class='results legacy-summary'><thead><tr><th>Severity</th><th>Count</th></tr></thead><tbody>"
+        f"{summary_rows}</tbody></table>"
+        + "".join(finding_sections) +
+        "</div></details>"
+    )
+
+
 _DASHBOARD_CSS = """
 body{font-family:Arial,Helvetica,sans-serif;background:#f7f7fb;color:#222;padding:20px}
 h1{margin-top:0;margin-bottom:12px}
+h2{margin:16px 0 8px}
 table.results{border-collapse:collapse;width:100%;background:#fff;border:1px solid #ddd}
 table.results th,table.results td{padding:10px;border-bottom:1px solid #eee;text-align:left}
 table.results th{background:#0f3460;color:#fff}
@@ -254,6 +325,13 @@ tr.tier-red a, tr.tier-amber a, tr.tier-green a{color:#fff;font-weight:bold}
 .summary-bar .tier-amber{background:#fd7e14}
 .summary-bar .tier-yellow{background:#ffc107;color:#000}
 .summary-bar .tier-green{background:#28a745}
+.muted{color:#5f6570}
+.legacy-policy{margin-top:10px;border:1px solid #d9dfea;border-radius:6px;background:#fff}
+.legacy-policy>summary{cursor:pointer;padding:10px 12px;font-weight:bold;background:#f3f6fc}
+.details-body{padding:10px 12px}
+.legacy-meta th{width:180px;background:#f8fafe;color:#22314f}
+.legacy-summary{max-width:420px;margin-bottom:10px}
+.legacy-findings th,.legacy-findings td{font-size:13px}
 """
 
 
