@@ -213,9 +213,37 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
     prefix = "BOT" if is_bot else "WAF"
     out_path = reports_dir / f"{prefix}_audit_dashboard.html"
 
+    hostnames = {
+        str(getattr(r, "device_hostname", "")).strip()
+        for r in ordered
+        if str(getattr(r, "device_hostname", "")).strip()
+    }
+    mgmt_ips = {
+        str(getattr(r, "device_mgmt_ip", "")).strip()
+        for r in ordered
+        if str(getattr(r, "device_mgmt_ip", "")).strip()
+    }
+    timestamps = [
+        str(getattr(r, "timestamp", "")).strip()
+        for r in ordered
+        if str(getattr(r, "timestamp", "")).strip()
+    ]
+
+    device_hostname = next(iter(hostnames)) if len(hostnames) == 1 else ("Multiple devices" if hostnames else "Unknown")
+    device_mgmt_ip = next(iter(mgmt_ips)) if len(mgmt_ips) == 1 else ("Multiple IPs" if mgmt_ips else "Unknown")
+    audit_timestamp = max(timestamps) if timestamps else "Unknown"
+
     rows = []
-    nav_cards = []
-    policy_sections = []
+    nav_cards = [
+        "<button type='button' class='policy-card summary-card active' data-target='summary-view'>"
+        "<div class='policy-card-title'>Summary</div>"
+        "<div class='policy-card-meta'>"
+        "<span>Default view: score table and tier distribution</span>"
+        "<span>Select a policy/profile card to load detailed findings</span>"
+        "</div>"
+        "</button>"
+    ]
+    policy_templates = []
     for idx, r in enumerate(ordered, 1):
         policy_id = f"policy-{idx}"
         tier_cls = _TIER_CLASS.get(r.tier, "")
@@ -234,7 +262,7 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
         ports_label = ", ".join(ports) if ports else "None"
 
         nav_cards.append(
-            f"<a class='policy-card {tier_cls}' href='#{policy_id}' data-target='{policy_id}'>"
+            f"<button type='button' class='policy-card {tier_cls}' data-target='{policy_id}'>"
             f"<div class='policy-card-title'>{_esc(r.policy_path)}</div>"
             f"<div class='policy-card-badges'>"
             f"<span class='policy-status {compliance_cls}'>{compliance_label}</span>"
@@ -245,7 +273,7 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
             f"<span>Compliance: <strong>{r.score:.1f}%</strong></span>"
             f"<span>Policy Ports: <strong>{_esc(ports_label)}</strong></span>"
             f"</div>"
-            "</a>"
+            "</button>"
         )
 
         rows.append(
@@ -261,7 +289,11 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
             f"<td>{len([d for d in r.findings if d.severity==SEVERITY_INFO])}</td>"
             "</tr>"
         )
-        policy_sections.append(_build_legacy_policy_section(r, section_id=policy_id))
+        policy_templates.append(
+            f"<template id='tpl-{policy_id}'>"
+            f"{_build_legacy_policy_section(r, section_id=policy_id)}"
+            "</template>"
+        )
 
     summary_bar = (
         f"<div class='summary-bar'>"
@@ -273,21 +305,30 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
     )
 
     css = _DASHBOARD_CSS
-    legacy_sections = "".join(policy_sections)
+    detail_templates = "".join(policy_templates)
 
     html_doc = (
         "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
         f"<title>{'Bot Defense' if is_bot else 'WAF'} Audit Dashboard</title>"
         f"<style>{css}</style>"
         "</head><body>"
+        "<section class='device-banner'>"
+        "<div class='device-banner-title'>Audit Device Context</div>"
+        "<div class='device-banner-grid'>"
+        f"<div><span class='label'>Hostname</span><strong>{_esc(device_hostname)}</strong></div>"
+        f"<div><span class='label'>Management IP</span><strong>{_esc(device_mgmt_ip)}</strong></div>"
+        f"<div><span class='label'>Audit Timestamp</span><strong>{_esc(audit_timestamp)}</strong></div>"
+        "</div>"
+        "</section>"
         "<div class='layout'>"
         "<aside class='sidebar'>"
         f"<h2>{'Bot Defense' if is_bot else 'WAF'} Policies</h2>"
-        "<p class='muted'>Select a policy card to jump to details.</p>"
+        "<p class='muted'>Summary is shown by default. Select a card to drill into details.</p>"
         f"<div class='policy-nav'>{''.join(nav_cards)}</div>"
         "</aside>"
         "<main class='main'>"
         f"<h1>{'Bot Defense' if is_bot else 'WAF'} Audit Dashboard</h1>"
+        "<section id='summary-view'>"
         f"{summary_bar}"
         "<table class='results'>"
         "<thead><tr>"
@@ -296,22 +337,46 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
         "</tr></thead><tbody>"
         + "".join(rows) +
         "</tbody></table>"
-        "<h2 style='margin-top:24px'>Detailed Combined Report</h2>"
-        "<p class='muted'>Legacy per-policy report content is included below for full audit detail.</p>"
-        f"{legacy_sections}"
+        "</section>"
+        "<section id='detail-view' class='detail-view'></section>"
+        f"{detail_templates}"
         "</main>"
         "</div>"
         "<script>"
         "(function(){"
-        "function updateActive(){"
-        "var hash=(window.location.hash||'').replace('#','');"
         "var cards=document.querySelectorAll('.policy-card');"
+        "var summary=document.getElementById('summary-view');"
+        "var detail=document.getElementById('detail-view');"
+        "function setActive(target){"
         "cards.forEach(function(card){"
-        "card.classList.toggle('active', hash && card.getAttribute('data-target')===hash);"
+        "card.classList.toggle('active', card.getAttribute('data-target')===target);"
         "});"
         "}"
-        "window.addEventListener('hashchange', updateActive);"
-        "updateActive();"
+        "function showSummary(){"
+        "summary.style.display='block';"
+        "detail.innerHTML='';"
+        "detail.style.display='none';"
+        "setActive('summary-view');"
+        "window.location.hash='summary';"
+        "}"
+        "function showPolicy(policyId){"
+        "var tpl=document.getElementById('tpl-'+policyId);"
+        "if(!tpl){return;}"
+        "summary.style.display='none';"
+        "detail.style.display='block';"
+        "detail.innerHTML=tpl.innerHTML;"
+        "setActive(policyId);"
+        "window.location.hash=policyId;"
+        "window.scrollTo({top:0,behavior:'smooth'});"
+        "}"
+        "cards.forEach(function(card){"
+        "card.addEventListener('click', function(){"
+        "var target=card.getAttribute('data-target');"
+        "if(target==='summary-view'){showSummary();return;}"
+        "showPolicy(target);"
+        "});"
+        "}"
+        "showSummary();"
         "})();"
         "</script>"
         "</body></html>"
@@ -500,21 +565,29 @@ html{scroll-behavior:smooth}
 body{font-family:Arial,Helvetica,sans-serif;background:#f7f7fb;color:#222;padding:20px;margin:0}
 h1{margin-top:0;margin-bottom:12px}
 h2{margin:16px 0 8px}
+.device-banner{background:linear-gradient(135deg,#0f3460,#1f4f85);color:#fff;border-radius:10px;padding:14px 16px;margin:0 0 14px;border:1px solid #0b2a4f}
+.device-banner-title{font-size:15px;font-weight:700;margin-bottom:8px;text-transform:uppercase;letter-spacing:.4px;opacity:.95}
+.device-banner-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.device-banner-grid .label{display:block;font-size:11px;opacity:.85;text-transform:uppercase;letter-spacing:.35px;margin-bottom:2px}
+.device-banner-grid strong{font-size:15px}
 .layout{display:flex;gap:18px;align-items:flex-start}
 .sidebar{width:320px;position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;background:#fff;border:1px solid #d9dfea;border-radius:8px;padding:12px}
 .main{flex:1;min-width:0}
 .policy-nav{display:flex;flex-direction:column;gap:10px}
-.policy-card{display:block;text-decoration:none;color:#1f2b3d;border:1px solid #d8deeb;border-radius:8px;background:#f8fafe;padding:10px;transition:border-color .15s,box-shadow .15s}
+.policy-card{display:block;text-decoration:none;color:#1f2b3d;border:1px solid #d8deeb;border-radius:8px;background:#f8fafe;padding:10px;transition:border-color .15s,box-shadow .15s;cursor:pointer;font:inherit;text-align:left;width:100%;appearance:none;-webkit-appearance:none}
 .policy-card:hover{border-color:#5b77ad;box-shadow:0 0 0 2px rgba(15,52,96,.15)}
 .policy-card.active{border-color:#0f3460;box-shadow:0 0 0 2px rgba(15,52,96,.25)}
 .policy-card-title{font-weight:700;margin-bottom:6px;word-break:break-word}
 .policy-card-meta{display:grid;gap:4px;font-size:12px}
+.policy-card-badges{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}
 .policy-mode{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700;width:fit-content}
 .policy-status{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700;width:fit-content}
 .status-compliant{background:#d4edda;color:#155724}
 .status-review{background:#ffe8a1;color:#7a5a00}
 .mode-blocking{background:#d4edda;color:#155724}
 .mode-transparent{background:#ffe9a8;color:#7a5a00}
+.summary-card{background:#eef5ff}
+.detail-view{display:none}
 table.results{border-collapse:collapse;width:100%;background:#fff;border:1px solid #ddd}
 table.results th,table.results td{padding:10px;border-bottom:1px solid #eee;text-align:left}
 table.results th{background:#0f3460;color:#fff}
