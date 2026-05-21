@@ -3,7 +3,7 @@ Report generation for WAF and Bot Defense audits (tiered scoring model).
 
 Changelog: Implemented 4-tier compliance rendering with circuit breaker
 disclosure, raw vs capped scores, deduction breakdowns, and color-coded
-dashboards replacing legacy PASS/FAIL views.
+dashboards replacing legacy binary status wording.
 """
 from __future__ import annotations
 
@@ -63,6 +63,7 @@ def generate_markdown(result: ComparisonResult, output_dir: str) -> Path:
     _md_header(lines, result)
     _md_circuit_breakers(lines, result)
     _md_deductions(lines, result)
+    _md_waf_violations(lines, result)
     _md_findings(lines, result)
 
     out_path.write_text("\n".join(lines), encoding="utf-8")
@@ -104,11 +105,42 @@ def _md_circuit_breakers(lines: List[str], result: ComparisonResult) -> None:
 
     lines += ["## Circuit Breakers", ""]
     lines.append(
-        "The following hard-fail conditions cap the score at 49 regardless of other deductions:" 
+        "The following circuit-breaker conditions cap the score at 49 regardless of other deductions:"
     )
     lines.append("")
     for cb in result.circuit_breakers_triggered:
         lines.append(f"- `{cb}`")
+    lines.append("")
+
+
+def _md_waf_violations(lines: List[str], result: ComparisonResult) -> None:
+    """Render per-violation learn/alarm/block comparison against baseline."""
+    if getattr(result, "profile_type", "waf") != "waf":
+        return
+
+    lines += ["## WAF Violations vs Baseline", ""]
+    comparison_rows = _waf_violation_comparison_rows(result)
+    if not comparison_rows:
+        lines += ["*No WAF violation settings were available for comparison.*", ""]
+        return
+
+    lines.append(
+        "| Violation | Baseline Learn | Policy Learn | Learn Match | "
+        "Baseline Alarm | Policy Alarm | Alarm Match | "
+        "Baseline Block | Policy Block | Block Match | Overall |"
+    )
+    lines.append(
+        "|-----------|----------------|-------------|-------------|"
+        "----------------|--------------|-------------|"
+        "----------------|--------------|-------------|---------|"
+    )
+    for row in comparison_rows:
+        lines.append(
+            "| "
+            f"`{row['violation']}` | {row['baseline_learn']} | {row['target_learn']} | {row['learn_match']} | "
+            f"{row['baseline_alarm']} | {row['target_alarm']} | {row['alarm_match']} | "
+            f"{row['baseline_block']} | {row['target_block']} | {row['block_match']} | {row['overall']} |"
+        )
     lines.append("")
 
 
@@ -196,8 +228,8 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
         mode_cls = "mode-blocking" if mode_is_blocking else "mode-transparent"
         status_label = r.tier_label
 
-        pass_fail = "PASS" if r.score >= 90.0 else "FAIL"
-        pass_fail_cls = "status-pass" if pass_fail == "PASS" else "status-fail"
+        compliance_label = "Compliant" if r.score >= 90.0 else "Needs Review"
+        compliance_cls = "status-compliant" if compliance_label == "Compliant" else "status-review"
         ports = sorted({str(v.get("port", "")).strip() for v in (r.virtual_servers or []) if str(v.get("port", "")).strip()})
         ports_label = ", ".join(ports) if ports else "None"
 
@@ -205,11 +237,11 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
             f"<a class='policy-card {tier_cls}' href='#{policy_id}' data-target='{policy_id}'>"
             f"<div class='policy-card-title'>{_esc(r.policy_path)}</div>"
             f"<div class='policy-card-badges'>"
-            f"<span class='policy-status {pass_fail_cls}'>{pass_fail}</span>"
+            f"<span class='policy-status {compliance_cls}'>{compliance_label}</span>"
             f"<span class='policy-mode {mode_cls}'>{mode_label}</span>"
             f"</div>"
             f"<div class='policy-card-meta'>"
-            f"<span>Status: <strong>{pass_fail}</strong> ({_esc(status_label)})</span>"
+            f"<span>Status: <strong>{compliance_label}</strong> ({_esc(status_label)})</span>"
             f"<span>Compliance: <strong>{r.score:.1f}%</strong></span>"
             f"<span>Policy Ports: <strong>{_esc(ports_label)}</strong></span>"
             f"</div>"
@@ -339,24 +371,127 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
             "</tbody></table></div></details>"
         )
 
+    violation_section = _build_waf_violation_table_html(result)
+
     raw_score = f"{result.raw_score:.1f}%" if result.is_hard_fail else "—"
     cb_text = ", ".join(result.circuit_breakers_triggered) if result.circuit_breakers_triggered else "None"
     section_id_attr = f" id='{_esc(section_id)}'" if section_id else ""
+    return "".join([
+        f"<details class='legacy-policy'{section_id_attr}>",
+        f"<summary><strong>{_esc(result.policy_path)}</strong> — {_TIER_EMOJI.get(result.tier,'')} {_esc(result.tier_label)} ({result.score:.1f}%)</summary>",
+        "<div class='details-body'>",
+        "<table class='results legacy-meta'><tbody>",
+        f"<tr><th>Partition</th><td>{_esc(result.partition)}</td><th>Enforcement Mode</th><td>{_esc(result.enforcement_mode)}</td></tr>",
+        f"<tr><th>Baseline</th><td>{_esc(result.baseline_name)}</td><th>Audit Date</th><td>{_esc(result.timestamp)}</td></tr>",
+        f"<tr><th>Score</th><td>{result.score:.1f}%</td><th>Raw Score</th><td>{raw_score}</td></tr>",
+        f"<tr><th>Circuit Breakers</th><td colspan='3'>{_esc(cb_text)}</td></tr>",
+        "</tbody></table>",
+        "<h3>Executive Summary</h3>",
+        "<table class='results legacy-summary'><thead><tr><th>Severity</th><th>Count</th></tr></thead><tbody>",
+        f"{summary_rows}</tbody></table>",
+        violation_section,
+        "".join(finding_sections),
+        "</div></details>",
+    ])
+
+
+def _normalize_violations_map(violations: List[Dict]) -> Dict[str, Dict]:
+    mapped: Dict[str, Dict] = {}
+    for item in violations or []:
+        vid = str(item.get("id") or item.get("name") or "").strip()
+        if not vid:
+            continue
+        mapped[vid] = item
+    return mapped
+
+
+def _format_violation_name(item: Dict, fallback_key: str) -> str:
+    name = str(item.get("name") or "").strip()
+    vid = str(item.get("id") or fallback_key).strip()
+    return f"{name} ({vid})" if name and name != vid else vid
+
+
+def _fmt_setting(value) -> str:
+    if value is None:
+        return "Not Set"
+    return human_bool(value)
+
+
+def _match_text(baseline_val, target_val) -> str:
+    return "Match ✅" if baseline_val == target_val else "Different ⚠️"
+
+
+def _waf_violation_comparison_rows(result: ComparisonResult) -> List[Dict[str, str]]:
+    baseline_map = _normalize_violations_map(result.baseline_violations)
+    target_map = _normalize_violations_map(result.violations)
+    all_ids = sorted(set(baseline_map) | set(target_map))
+
+    rows: List[Dict[str, str]] = []
+    for vid in all_ids:
+        base = baseline_map.get(vid, {})
+        targ = target_map.get(vid, {})
+        b_learn, t_learn = base.get("learn"), targ.get("learn")
+        b_alarm, t_alarm = base.get("alarm"), targ.get("alarm")
+        b_block, t_block = base.get("block"), targ.get("block")
+
+        learn_match = _match_text(b_learn, t_learn)
+        alarm_match = _match_text(b_alarm, t_alarm)
+        block_match = _match_text(b_block, t_block)
+        overall_match = "All Match ✅" if (b_learn == t_learn and b_alarm == t_alarm and b_block == t_block) else "Differences Found ⚠️"
+
+        rows.append({
+            "violation": _format_violation_name(base or targ, vid),
+            "baseline_learn": _fmt_setting(b_learn),
+            "target_learn": _fmt_setting(t_learn),
+            "learn_match": learn_match,
+            "baseline_alarm": _fmt_setting(b_alarm),
+            "target_alarm": _fmt_setting(t_alarm),
+            "alarm_match": alarm_match,
+            "baseline_block": _fmt_setting(b_block),
+            "target_block": _fmt_setting(t_block),
+            "block_match": block_match,
+            "overall": overall_match,
+        })
+
+    return rows
+
+
+def _build_waf_violation_table_html(result: ComparisonResult) -> str:
+    if getattr(result, "profile_type", "waf") != "waf":
+        return ""
+
+    rows = _waf_violation_comparison_rows(result)
+    if not rows:
+        return "<h3>WAF Violations vs Baseline</h3><p class='muted'>No WAF violation settings were available for comparison.</p>"
+
+    body_rows = []
+    for row in rows:
+        body_rows.append(
+            "<tr>"
+            f"<td>{_esc(row['violation'])}</td>"
+            f"<td>{_esc(row['baseline_learn'])}</td>"
+            f"<td>{_esc(row['target_learn'])}</td>"
+            f"<td>{_esc(row['learn_match'])}</td>"
+            f"<td>{_esc(row['baseline_alarm'])}</td>"
+            f"<td>{_esc(row['target_alarm'])}</td>"
+            f"<td>{_esc(row['alarm_match'])}</td>"
+            f"<td>{_esc(row['baseline_block'])}</td>"
+            f"<td>{_esc(row['target_block'])}</td>"
+            f"<td>{_esc(row['block_match'])}</td>"
+            f"<td>{_esc(row['overall'])}</td>"
+            "</tr>"
+        )
+
     return (
-        f"<details class='legacy-policy'{section_id_attr}>"
-        f"<summary><strong>{_esc(result.policy_path)}</strong> — {_TIER_EMOJI.get(result.tier,'')} {_esc(result.tier_label)} ({result.score:.1f}%)</summary>"
-        "<div class='details-body'>"
-        "<table class='results legacy-meta'><tbody>"
-        f"<tr><th>Partition</th><td>{_esc(result.partition)}</td><th>Enforcement Mode</th><td>{_esc(result.enforcement_mode)}</td></tr>"
-        f"<tr><th>Baseline</th><td>{_esc(result.baseline_name)}</td><th>Audit Date</th><td>{_esc(result.timestamp)}</td></tr>"
-        f"<tr><th>Score</th><td>{result.score:.1f}%</td><th>Raw Score</th><td>{raw_score}</td></tr>"
-        f"<tr><th>Circuit Breakers</th><td colspan='3'>{_esc(cb_text)}</td></tr>"
+        "<h3>WAF Violations vs Baseline</h3>"
+        "<table class='results violation-compare'>"
+        "<thead><tr>"
+        "<th>Violation</th><th>Baseline Learn</th><th>Policy Learn</th><th>Learn Match</th>"
+        "<th>Baseline Alarm</th><th>Policy Alarm</th><th>Alarm Match</th>"
+        "<th>Baseline Block</th><th>Policy Block</th><th>Block Match</th><th>Overall</th>"
+        "</tr></thead><tbody>"
+        + "".join(body_rows) +
         "</tbody></table>"
-        "<h3>Executive Summary</h3>"
-        "<table class='results legacy-summary'><thead><tr><th>Severity</th><th>Count</th></tr></thead><tbody>"
-        f"{summary_rows}</tbody></table>"
-        + "".join(finding_sections) +
-        "</div></details>"
     )
 
 
@@ -375,6 +510,9 @@ h2{margin:16px 0 8px}
 .policy-card-title{font-weight:700;margin-bottom:6px;word-break:break-word}
 .policy-card-meta{display:grid;gap:4px;font-size:12px}
 .policy-mode{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700;width:fit-content}
+.policy-status{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700;width:fit-content}
+.status-compliant{background:#d4edda;color:#155724}
+.status-review{background:#ffe8a1;color:#7a5a00}
 .mode-blocking{background:#d4edda;color:#155724}
 .mode-transparent{background:#ffe9a8;color:#7a5a00}
 table.results{border-collapse:collapse;width:100%;background:#fff;border:1px solid #ddd}
@@ -399,6 +537,7 @@ tr.tier-red a, tr.tier-amber a, tr.tier-green a{color:#fff;font-weight:bold}
 .legacy-meta th{width:180px;background:#f8fafe;color:#22314f}
 .legacy-summary{max-width:420px;margin-bottom:10px}
 .legacy-findings th,.legacy-findings td{font-size:13px}
+.violation-compare th,.violation-compare td{font-size:12px}
 """
 
 
