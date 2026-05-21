@@ -12,6 +12,7 @@ import functools
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -241,7 +242,7 @@ class TierInfo:
     circuit_breakers: list[str]
 
 
-def score_to_tier(score: float, circuit_breakers: list[str] | None = None, green_threshold: float = 90.0) -> TierInfo:
+def score_to_tier(score: float, circuit_breakers: Optional[List[str]] = None, green_threshold: float = 90.0) -> TierInfo:
     """Map a numeric score to a tier.
 
     Args:
