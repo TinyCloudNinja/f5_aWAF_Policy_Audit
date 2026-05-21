@@ -182,6 +182,11 @@ def _parse_blocking(root) -> Dict:
 
     Returns a dict with keys: enforcement_mode, passive_mode, violations (list).
     Returns an empty dict when the section is absent.
+
+    Important: do not default enforcement_mode to "transparent" when the
+    <blocking> section omits it. Some exports only define mode in
+    <general>/<enforcement-mode>, and a transparent default here can mask a
+    truly blocking policy in downstream reporting.
     """
     bl = _find(root, "blocking")
     if bl is None:
@@ -191,7 +196,7 @@ def _parse_blocking(root) -> Dict:
     pm_raw  = _text(bl, "passive_mode") or _text(bl, "passive-mode")
 
     return {
-        "enforcement_mode": em_raw or "transparent",
+        "enforcement_mode": em_raw,
         "passive_mode":     pm_raw or "disabled",
         "violations": [
             _parse_blocking_violation(v) for v in _findall(bl, "violation")

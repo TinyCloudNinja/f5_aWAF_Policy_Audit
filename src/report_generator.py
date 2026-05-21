@@ -182,10 +182,40 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
     out_path = reports_dir / f"{prefix}_audit_dashboard.html"
 
     rows = []
-    for r in ordered:
+    nav_cards = []
+    policy_sections = []
+    for idx, r in enumerate(ordered, 1):
+        policy_id = f"policy-{idx}"
         tier_cls = _TIER_CLASS.get(r.tier, "")
         cb_col = ", ".join(r.circuit_breakers_triggered) if r.circuit_breakers_triggered else "—"
         raw_col = f"{r.raw_score:.1f}" if r.is_hard_fail else "—"
+
+        mode_text = (r.enforcement_mode or "transparent").strip().lower()
+        mode_is_blocking = "block" in mode_text
+        mode_label = "Blocking" if mode_is_blocking else "Transparent"
+        mode_cls = "mode-blocking" if mode_is_blocking else "mode-transparent"
+        status_label = r.tier_label
+
+        pass_fail = "PASS" if r.score >= 90.0 else "FAIL"
+        pass_fail_cls = "status-pass" if pass_fail == "PASS" else "status-fail"
+        ports = sorted({str(v.get("port", "")).strip() for v in (r.virtual_servers or []) if str(v.get("port", "")).strip()})
+        ports_label = ", ".join(ports) if ports else "None"
+
+        nav_cards.append(
+            f"<a class='policy-card {tier_cls}' href='#{policy_id}' data-target='{policy_id}'>"
+            f"<div class='policy-card-title'>{_esc(r.policy_path)}</div>"
+            f"<div class='policy-card-badges'>"
+            f"<span class='policy-status {pass_fail_cls}'>{pass_fail}</span>"
+            f"<span class='policy-mode {mode_cls}'>{mode_label}</span>"
+            f"</div>"
+            f"<div class='policy-card-meta'>"
+            f"<span>Status: <strong>{pass_fail}</strong> ({_esc(status_label)})</span>"
+            f"<span>Compliance: <strong>{r.score:.1f}%</strong></span>"
+            f"<span>Policy Ports: <strong>{_esc(ports_label)}</strong></span>"
+            f"</div>"
+            "</a>"
+        )
+
         rows.append(
             "<tr class='" + tier_cls + "'>"
             f"<td>{_esc(r.policy_path)}</td>"
@@ -199,6 +229,7 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
             f"<td>{len([d for d in r.findings if d.severity==SEVERITY_INFO])}</td>"
             "</tr>"
         )
+        policy_sections.append(_build_legacy_policy_section(r, section_id=policy_id))
 
     summary_bar = (
         f"<div class='summary-bar'>"
@@ -210,13 +241,20 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
     )
 
     css = _DASHBOARD_CSS
-    legacy_sections = "".join(_build_legacy_policy_section(r) for r in ordered)
+    legacy_sections = "".join(policy_sections)
 
     html_doc = (
         "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
         f"<title>{'Bot Defense' if is_bot else 'WAF'} Audit Dashboard</title>"
         f"<style>{css}</style>"
         "</head><body>"
+        "<div class='layout'>"
+        "<aside class='sidebar'>"
+        f"<h2>{'Bot Defense' if is_bot else 'WAF'} Policies</h2>"
+        "<p class='muted'>Select a policy card to jump to details.</p>"
+        f"<div class='policy-nav'>{''.join(nav_cards)}</div>"
+        "</aside>"
+        "<main class='main'>"
         f"<h1>{'Bot Defense' if is_bot else 'WAF'} Audit Dashboard</h1>"
         f"{summary_bar}"
         "<table class='results'>"
@@ -229,6 +267,21 @@ def generate_html_dashboard(results: List[ComparisonResult], output_dir: str) ->
         "<h2 style='margin-top:24px'>Detailed Combined Report</h2>"
         "<p class='muted'>Legacy per-policy report content is included below for full audit detail.</p>"
         f"{legacy_sections}"
+        "</main>"
+        "</div>"
+        "<script>"
+        "(function(){"
+        "function updateActive(){"
+        "var hash=(window.location.hash||'').replace('#','');"
+        "var cards=document.querySelectorAll('.policy-card');"
+        "cards.forEach(function(card){"
+        "card.classList.toggle('active', hash && card.getAttribute('data-target')===hash);"
+        "});"
+        "}"
+        "window.addEventListener('hashchange', updateActive);"
+        "updateActive();"
+        "})();"
+        "</script>"
         "</body></html>"
     )
 
@@ -241,7 +294,7 @@ def _esc(val) -> str:
     return html.escape(str(val))
 
 
-def _build_legacy_policy_section(result: ComparisonResult) -> str:
+def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "") -> str:
     """Render a legacy-style per-policy combined detail block."""
     sev_order = [SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_WARNING, SEVERITY_INFO]
     sev_labels = {
@@ -288,8 +341,9 @@ def _build_legacy_policy_section(result: ComparisonResult) -> str:
 
     raw_score = f"{result.raw_score:.1f}%" if result.is_hard_fail else "—"
     cb_text = ", ".join(result.circuit_breakers_triggered) if result.circuit_breakers_triggered else "None"
+    section_id_attr = f" id='{_esc(section_id)}'" if section_id else ""
     return (
-        "<details class='legacy-policy'>"
+        f"<details class='legacy-policy'{section_id_attr}>"
         f"<summary><strong>{_esc(result.policy_path)}</strong> — {_TIER_EMOJI.get(result.tier,'')} {_esc(result.tier_label)} ({result.score:.1f}%)</summary>"
         "<div class='details-body'>"
         "<table class='results legacy-meta'><tbody>"
@@ -307,9 +361,22 @@ def _build_legacy_policy_section(result: ComparisonResult) -> str:
 
 
 _DASHBOARD_CSS = """
-body{font-family:Arial,Helvetica,sans-serif;background:#f7f7fb;color:#222;padding:20px}
+html{scroll-behavior:smooth}
+body{font-family:Arial,Helvetica,sans-serif;background:#f7f7fb;color:#222;padding:20px;margin:0}
 h1{margin-top:0;margin-bottom:12px}
 h2{margin:16px 0 8px}
+.layout{display:flex;gap:18px;align-items:flex-start}
+.sidebar{width:320px;position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;background:#fff;border:1px solid #d9dfea;border-radius:8px;padding:12px}
+.main{flex:1;min-width:0}
+.policy-nav{display:flex;flex-direction:column;gap:10px}
+.policy-card{display:block;text-decoration:none;color:#1f2b3d;border:1px solid #d8deeb;border-radius:8px;background:#f8fafe;padding:10px;transition:border-color .15s,box-shadow .15s}
+.policy-card:hover{border-color:#5b77ad;box-shadow:0 0 0 2px rgba(15,52,96,.15)}
+.policy-card.active{border-color:#0f3460;box-shadow:0 0 0 2px rgba(15,52,96,.25)}
+.policy-card-title{font-weight:700;margin-bottom:6px;word-break:break-word}
+.policy-card-meta{display:grid;gap:4px;font-size:12px}
+.policy-mode{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700;width:fit-content}
+.mode-blocking{background:#d4edda;color:#155724}
+.mode-transparent{background:#ffe9a8;color:#7a5a00}
 table.results{border-collapse:collapse;width:100%;background:#fff;border:1px solid #ddd}
 table.results th,table.results td{padding:10px;border-bottom:1px solid #eee;text-align:left}
 table.results th{background:#0f3460;color:#fff}

@@ -159,9 +159,26 @@ def compare_policies(
     """
 
     meta = policy_meta or {}
+
+    def _normalize_enforcement_mode(raw: object) -> str:
+        """Normalize enforcement mode values from mixed BIG-IP sources.
+
+        Some exports/API payloads contain extra whitespace, mixed case, or
+        composite labels. We normalize to canonical values where possible to
+        avoid rendering a blocking policy as transparent.
+        """
+        text = str(raw or "").strip().lower()
+        if not text:
+            return "transparent"
+        if "block" in text:
+            return "blocking"
+        if "transparent" in text:
+            return "transparent"
+        return text
+
     # Prefer explicit blocking section enforcement_mode when present; fall back to
     # general.enforcementMode. Default to "transparent" only when neither is set.
-    target_enforcement_mode = (
+    target_enforcement_mode = _normalize_enforcement_mode(
         target.get("blocking", {}).get("enforcement_mode")
         or target.get("general", {}).get("enforcementMode")
         or "transparent"
