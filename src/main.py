@@ -28,6 +28,7 @@ from .utils import (
 )
 from .bigip_client import BigIPClient, AuthenticationError
 from .policy_exporter import PolicyExporter, ExportError
+from .policy_inspector import PolicyInspector, print_inspection_table
 from .policy_parser import parse_policy, get_policy_metadata
 from .policy_comparator import compare_policies
 from .bot_defense_auditor import BotDefenseAuditor
@@ -113,6 +114,13 @@ def _build_parser() -> argparse.ArgumentParser:
     mode_group.add_argument(
         "--BOT", dest="audit_mode", action="store_const", const="bot",
         help="Audit Bot Defense profiles against a JSON baseline",
+    )
+    mode_group.add_argument(
+        "--INSPECT", dest="audit_mode", action="store_const", const="inspect",
+        help=(
+            "Inspect ASM/AWAF policies via targeted REST calls (no export task). "
+            "Emits <output-dir>/inspection.json. Does not require --baseline."
+        ),
     )
 
     # Tiered scoring controls
@@ -386,13 +394,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     log = setup_logging(verbose, output_dir, audit_mode)
     logger = get_logger("main")
 
-    # Validate required arguments
+    # Validate required arguments (--baseline not required for --INSPECT)
     missing = []
     if not host:
         missing.append("--host / BIGIP_HOST")
     if not username:
         missing.append("--username / BIGIP_USER")
-    if not baseline:
+    if audit_mode != "inspect" and not baseline:
         missing.append("--baseline")
     if missing:
         parser.print_usage()
@@ -516,8 +524,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         client.close()
         return 2
 
-    # ── Branch: WAF audit vs Bot Defense audit ────────────────────────────────
-    if audit_mode == "bot":
+    # ── Branch: inspect / WAF audit / Bot Defense audit ──────────────────────
+    if audit_mode == "inspect":
+        return _run_inspect_audit(
+            client=client,
+            exporter=exporter,
+            all_partitions=all_partitions,
+            output_dir=output_dir,
+            concurrent=concurrent,
+            device_hostname=device_hostname,
+            device_mgmt_ip=device_mgmt_ip,
+            logger=logger,
+        )
+    elif audit_mode == "bot":
         return _run_bot_audit(
             client=client,
             all_partitions=all_partitions,
@@ -550,6 +569,52 @@ def main(argv: Optional[List[str]] = None) -> int:
             fail_on_tier=fail_on_tier,
             pass_threshold=pass_threshold,
         )
+
+
+# ── Inspect workflow ───────────────────────────────────────────────────────────
+
+def _run_inspect_audit(
+    client, exporter, all_partitions, output_dir, concurrent,
+    device_hostname, device_mgmt_ip, logger,
+) -> int:
+    """Run the fast REST-based policy inspection (no export task)."""
+    try:
+        policies = exporter.discover_policies(all_partitions)
+    except ExportError as exc:
+        logger.error("Policy discovery failed: %s", exc)
+        client.close()
+        return 2
+
+    if not policies:
+        logger.warning("No ASM/AWAF policies found. Exiting.")
+        client.close()
+        return 0
+
+    exporter.print_discovery_table(policies)
+
+    inspector = PolicyInspector(client=client, concurrent=concurrent)
+    results = inspector.inspect_all(policies)
+
+    # Write JSON output
+    out_dir = ensure_dir(output_dir)
+    out_path = out_dir / "inspection.json"
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(results, fh, indent=2)
+    logger.info("Inspection results written to %s", out_path)
+
+    client.close()
+
+    print_inspection_table(results)
+
+    errors_total = sum(len(r.get("errors", [])) for r in results)
+    if errors_total:
+        logger.warning(
+            "%d sub-call error(s) across %d policies — see inspection.json for details.",
+            errors_total, len(results),
+        )
+
+    print(f"Inspection JSON: {out_path}")
+    return 0
 
 
 # ── WAF audit workflow ─────────────────────────────────────────────────────────
