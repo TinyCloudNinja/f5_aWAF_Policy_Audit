@@ -1,0 +1,105 @@
+{
+  "items": [
+    {
+      "name": "vs_no_http",
+      "partition": "Common",
+      "fullPath": "/Common/vs_no_http",
+      "destination": "/Common/10.0.0.10:80",
+      "profilesReference": {
+        "items": [
+          {
+            "name": "tcp",
+            "partition": "Common",
+            "fullPath": "/Common/tcp",
+            "type": "tcp"
+          }
+        ]
+      }
+    },
+    {
+      "name": "vs_http_capable",
+      "partition": "Common",
+      "fullPath": "/Common/vs_http_capable",
+      "destination": "/Common/10.0.0.11:443",
+      "profilesReference": {
+        "items": [
+          {
+            "name": "http",
+            "partition": "Common",
+            "fullPath": "/Common/http",
+            "type": "http"
+          }
+        ]
+      }
+    },
+    {
+      "name": "vs_direct_waf",
+      "partition": "Common",
+      "fullPath": "/Common/vs_direct_waf",
+      "destination": "/Common/10.0.0.12:443",
+      "profilesReference": {
+        "items": [
+          {
+            "name": "http",
+            "partition": "Common",
+            "fullPath": "/Common/http",
+            "type": "http"
+          }
+        ]
+      },
+      "asmPolicy": {
+        "id": "2001"
+      }
+    },
+    {
+      "name": "vs_ltm_host",
+      "partition": "Common",
+      "fullPath": "/Common/vs_ltm_host",
+      "destination": "/Common/10.0.0.13:443",
+      "profilesReference": {
+        "items": [
+          {
+            "name": "http",
+            "partition": "Common",
+            "fullPath": "/Common/http",
+            "type": "http"
+          }
+        ]
+      },
+      "policiesReference": {
+        "items": [
+          {
+            "name": "ltm_host_policy",
+            "partition": "Common",
+            "fullPath": "/Common/ltm_host_policy"
+          }
+        ]
+      }
+    },
+    {
+      "name": "vs_ltm_any",
+      "partition": "Common",
+      "fullPath": "/Common/vs_ltm_any",
+      "destination": "/Common/10.0.0.14:443",
+      "profilesReference": {
+        "items": [
+          {
+            "name": "http",
+            "partition": "Common",
+            "fullPath": "/Common/http",
+            "type": "http"
+          }
+        ]
+      },
+      "policiesReference": {
+        "items": [
+          {
+            "name": "ltm_any_policy",
+            "partition": "Common",
+            "fullPath": "/Common/ltm_any_policy"
+          }
+        ]
+      }
+    }
+  ]
+}

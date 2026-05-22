@@ -32,8 +32,14 @@ from .policy_parser import parse_policy, get_policy_metadata
 from .policy_comparator import compare_policies
 from .bot_defense_auditor import BotDefenseAuditor
 from .bot_defense_comparator import compare_bot_profiles
-from .report_generator import generate_html_dashboard, generate_markdown, generate_summary_reports
+from .report_generator import (
+    generate_html_dashboard,
+    generate_markdown,
+    generate_summary_reports,
+    generate_virtual_server_summary_markdown,
+)
 from .gitlab_state import GitLabStateManager
+from .virtual_server_inventory import collect_virtual_server_inventory
 
 import urllib3
 
@@ -555,6 +561,9 @@ def _run_waf_audit(
     pass_threshold: float,
 ) -> int:
     """Run the existing ASM/AWAF policy audit."""
+    virtual_server_inventory = []
+    virtual_server_inventory_error: Optional[str] = None
+
     try:
         policies = exporter.discover_policies(all_partitions)
     except ExportError as exc:
@@ -571,6 +580,22 @@ def _run_waf_audit(
 
     # Enrich with virtual server bindings
     exporter.enrich_with_virtual_servers(policies)
+
+    try:
+        logger.info(
+            "Collecting virtual server inventory across %d partition(s)...",
+            len(all_partitions),
+        )
+        virtual_server_inventory = collect_virtual_server_inventory(
+            bigip_client=client,
+            partitions=all_partitions,
+        )
+    except Exception as exc:
+        virtual_server_inventory_error = str(exc)
+        logger.error(
+            "Virtual server inventory collection failed; continuing with policy audit: %s",
+            exc,
+        )
 
     # Export policies
     successes, failures = exporter.export_all(policies)
@@ -672,11 +697,22 @@ def _run_waf_audit(
 
     if all_results:
         if "html" in formats:
-            generate_html_dashboard(all_results, output_dir)
+            generate_html_dashboard(
+                all_results,
+                output_dir,
+                virtual_server_inventory=virtual_server_inventory,
+                virtual_server_inventory_error=virtual_server_inventory_error,
+            )
 
         summary_formats = [f for f in formats if f != "html"]
         if summary_formats:
             generate_summary_reports(all_results, output_dir, summary_formats)
+        if "markdown" in formats:
+            generate_virtual_server_summary_markdown(
+                virtual_server_inventory=virtual_server_inventory,
+                output_dir=output_dir,
+                inventory_error=virtual_server_inventory_error,
+            )
 
     if sot_results:
         sot_output_dir = str(Path(output_dir) / "source_of_truth")
@@ -684,10 +720,21 @@ def _run_waf_audit(
             if "markdown" in formats:
                 generate_markdown(r, sot_output_dir)
         if "html" in formats:
-            generate_html_dashboard(sot_results, sot_output_dir)
+            generate_html_dashboard(
+                sot_results,
+                sot_output_dir,
+                virtual_server_inventory=virtual_server_inventory,
+                virtual_server_inventory_error=virtual_server_inventory_error,
+            )
         summary_formats = [f for f in formats if f != "html"]
         if summary_formats:
             generate_summary_reports(sot_results, sot_output_dir, summary_formats)
+        if "markdown" in formats:
+            generate_virtual_server_summary_markdown(
+                virtual_server_inventory=virtual_server_inventory,
+                output_dir=sot_output_dir,
+                inventory_error=virtual_server_inventory_error,
+            )
         logger.info(
             "Generated %d source-of-truth comparison report(s) under %s",
             len(sot_results),

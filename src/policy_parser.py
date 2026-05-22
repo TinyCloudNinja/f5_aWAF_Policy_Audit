@@ -22,8 +22,15 @@ _log = get_logger("policy_parser")
 
 # ── Namespace helpers ──────────────────────────────────────────────────────────
 
-def _strip_ns(tag: str) -> str:
-    """Remove XML namespace from a tag, e.g. '{http://...}name' → 'name'."""
+def _strip_ns(tag: Any) -> str:
+    """Remove XML namespace from a tag, e.g. '{http://...}name' → 'name'.
+
+    Some XML parsers (notably lxml) can expose comment/PI nodes while iterating
+    children, where ``child.tag`` is not a string. In those cases return an
+    empty tag so namespace stripping remains safe.
+    """
+    if not isinstance(tag, str):
+        return ""
     return re.sub(r'\{[^}]+\}', '', tag)
 
 
