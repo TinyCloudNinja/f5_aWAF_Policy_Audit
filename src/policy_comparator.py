@@ -131,6 +131,7 @@ class ComparisonResult:
     raw_score: float = 100.0
     deductions_by_severity: Dict[str, float] = field(default_factory=dict)
     deductions_by_section: Dict[str, float] = field(default_factory=dict)
+    learning_mode: str = ""
 
     def __post_init__(self) -> None:
         # Keep findings and diffs pointing to the same list for backward compatibility

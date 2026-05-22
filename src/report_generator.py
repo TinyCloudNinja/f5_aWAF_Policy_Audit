@@ -640,7 +640,7 @@ def _esc(val) -> str:
 
 
 def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "") -> str:
-    """Render a legacy-style per-policy combined detail block."""
+    """Render a per-policy detail block — always expanded, no collapsible elements."""
     sev_order = [SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_WARNING, SEVERITY_INFO]
     sev_labels = {
         SEVERITY_CRITICAL: "Critical",
@@ -649,11 +649,33 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
         SEVERITY_INFO: "Informational",
     }
 
+    # 1 — Metadata table
+    raw_score = f"{result.raw_score:.1f}%" if result.is_hard_fail else "—"
+    cb_text = ", ".join(result.circuit_breakers_triggered) if result.circuit_breakers_triggered else "None"
+
+    mode_text = (result.enforcement_mode or "transparent").strip().lower()
+    mode_is_blocking = "block" in mode_text
+    mode_label = "Blocking" if mode_is_blocking else "Transparent"
+    mode_cls = "mode-blocking" if mode_is_blocking else "mode-transparent"
+    enforcement_badge = f"<span class='policy-mode {mode_cls}'>{mode_label}</span>"
+    learning_badge = _learning_mode_badge(getattr(result, "learning_mode", ""))
+
+    meta_table = "".join([
+        "<table class='results legacy-meta'><tbody>",
+        f"<tr><th>Partition</th><td>{_esc(result.partition)}</td><th>Baseline</th><td>{_esc(result.baseline_name)}</td></tr>",
+        f"<tr><th>Enforcement Mode</th><td>{enforcement_badge}</td><th>Learning Mode</th><td>{learning_badge}</td></tr>",
+        f"<tr><th>Audit Date</th><td>{_esc(result.timestamp)}</td><th>Score</th><td>{result.score:.1f}%</td></tr>",
+        f"<tr><th>Raw Score</th><td>{raw_score}</td><th>Circuit Breakers</th><td>{_esc(cb_text)}</td></tr>",
+        "</tbody></table>",
+    ])
+
+    # 6 — Findings by severity summary count table
     summary_rows = ""
     for sev in sev_order:
         count = len([d for d in result.findings if d.severity == sev])
         summary_rows += f"<tr><td>{sev_labels[sev]}</td><td>{count}</td></tr>"
 
+    # 7 — Individual finding sections (always expanded)
     finding_sections: List[str] = []
     for sev in sev_order:
         items = [d for d in result.findings if d.severity == sev]
@@ -671,41 +693,44 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
                 f"<td>{_esc(diff.description)}</td>"
                 "</tr>"
             )
-
         finding_sections.append(
-            "<details>"
-            f"<summary>{sev_labels[sev]} Findings ({len(items)})</summary>"
-            "<div class='details-body'>"
+            "<section>"
+            f"<h3 class='section-heading'>{sev_labels[sev]} Findings ({len(items)})</h3>"
             "<table class='results legacy-findings'>"
             "<thead><tr>"
             "<th>Section</th><th>Element</th><th>Attribute</th><th>Baseline</th><th>Target</th><th>Description</th>"
             "</tr></thead><tbody>"
             + "".join(rows) +
-            "</tbody></table></div></details>"
+            "</tbody></table></section>"
         )
 
-    violation_section = _build_waf_violation_table_html(result)
+    id_attr = f" id='{_esc(section_id)}'" if section_id else ""
+    is_waf = getattr(result, "profile_type", "waf") == "waf"
 
-    raw_score = f"{result.raw_score:.1f}%" if result.is_hard_fail else "—"
-    cb_text = ", ".join(result.circuit_breakers_triggered) if result.circuit_breakers_triggered else "None"
-    section_id_attr = f" id='{_esc(section_id)}'" if section_id else ""
-    return "".join([
-        f"<details class='legacy-policy'{section_id_attr}>",
-        f"<summary><strong>{_esc(result.policy_path)}</strong> — {_TIER_EMOJI.get(result.tier,'')} {_esc(result.tier_label)} ({result.score:.1f}%)</summary>",
-        "<div class='details-body'>",
-        "<table class='results legacy-meta'><tbody>",
-        f"<tr><th>Partition</th><td>{_esc(result.partition)}</td><th>Enforcement Mode</th><td>{_esc(result.enforcement_mode)}</td></tr>",
-        f"<tr><th>Baseline</th><td>{_esc(result.baseline_name)}</td><th>Audit Date</th><td>{_esc(result.timestamp)}</td></tr>",
-        f"<tr><th>Score</th><td>{result.score:.1f}%</td><th>Raw Score</th><td>{raw_score}</td></tr>",
-        f"<tr><th>Circuit Breakers</th><td colspan='3'>{_esc(cb_text)}</td></tr>",
-        "</tbody></table>",
-        "<h3>Executive Summary</h3>",
+    parts: List[str] = [f"<div class='legacy-policy-panel'{id_attr}>", meta_table]
+
+    if is_waf:
+        parts += [
+            "<h3 class='section-heading'>WAF Violations — Learn / Alarm / Block</h3>",
+            _build_waf_violations_grouped_html(result),
+            "<h3 class='section-heading'>WAF Violations vs Baseline</h3>",
+            _build_waf_violation_table_html(result),
+            "<h3 class='section-heading'>Applied Attack Signature Sets</h3>",
+            _build_signature_sets_html(result),
+        ]
+
+    parts += [
+        "<h3 class='section-heading'>Audit Log (Last 10 Changes)</h3>",
+        _build_audit_log_html(result),
+        "<h3 class='section-heading'>Findings by Severity</h3>",
         "<table class='results legacy-summary'><thead><tr><th>Severity</th><th>Count</th></tr></thead><tbody>",
-        f"{summary_rows}</tbody></table>",
-        violation_section,
+        summary_rows,
+        "</tbody></table>",
         "".join(finding_sections),
-        "</div></details>",
-    ])
+        "</div>",
+    ]
+
+    return "".join(parts)
 
 
 def _normalize_violations_map(violations: List[Dict]) -> Dict[str, Dict]:
@@ -775,7 +800,7 @@ def _build_waf_violation_table_html(result: ComparisonResult) -> str:
 
     rows = _waf_violation_comparison_rows(result)
     if not rows:
-        return "<h3>WAF Violations vs Baseline</h3><p class='muted'>No WAF violation settings were available for comparison.</p>"
+        return "<p class='muted'>No WAF violation settings were available for comparison.</p>"
 
     body_rows = []
     for row in rows:
@@ -796,7 +821,6 @@ def _build_waf_violation_table_html(result: ComparisonResult) -> str:
         )
 
     return (
-        "<h3>WAF Violations vs Baseline</h3>"
         "<table class='results violation-compare'>"
         "<thead><tr>"
         "<th>Violation</th><th>Baseline Learn</th><th>Policy Learn</th><th>Learn Match</th>"
@@ -805,6 +829,92 @@ def _build_waf_violation_table_html(result: ComparisonResult) -> str:
         "</tr></thead><tbody>"
         + "".join(body_rows) +
         "</tbody></table>"
+    )
+
+
+def _learning_mode_badge(mode: str) -> str:
+    m = (mode or "").strip().lower()
+    if m == "automatic":
+        return "<span class='policy-mode' style='background:#d4edda;color:#155724'>Automatic</span>"
+    if m == "manual":
+        return "<span class='policy-mode' style='background:#cce5ff;color:#004085'>Manual</span>"
+    return "<span class='policy-mode' style='background:#e9ecef;color:#495057'>Off</span>"
+
+
+def _build_waf_violations_grouped_html(result: ComparisonResult) -> str:
+    if getattr(result, "profile_type", "waf") != "waf":
+        return ""
+
+    violations = result.violations or []
+
+    def _viol_name(v: Dict) -> str:
+        name = str(v.get("name") or "").strip()
+        return name if name else str(v.get("id") or "")
+
+    def _ul(items: List[Dict]) -> str:
+        if not items:
+            return "<ul><li class='muted'>None</li></ul>"
+        return "<ul>" + "".join(f"<li>{_esc(_viol_name(v))}</li>" for v in items) + "</ul>"
+
+    learn_items = [v for v in violations if v.get("learn")]
+    alarm_items = [v for v in violations if v.get("alarm")]
+    block_items = [v for v in violations if v.get("block")]
+
+    cards = (
+        "<div class='vcard'>"
+        "<div class='vcard-title learn'>Learn</div>"
+        + _ul(learn_items) +
+        "</div>"
+        "<div class='vcard'>"
+        "<div class='vcard-title alarm'>Alarm</div>"
+        + _ul(alarm_items) +
+        "</div>"
+        "<div class='vcard'>"
+        "<div class='vcard-title block'>Block</div>"
+        + _ul(block_items) +
+        "</div>"
+    )
+    return "<div class='violation-cards'>" + cards + "</div>"
+
+
+def _build_signature_sets_html(result: ComparisonResult) -> str:
+    sets = result.target_signature_sets or []
+    if not sets:
+        return "<p class='muted'>No signature sets applied.</p>"
+
+    body_rows = []
+    for s in sets:
+        name = _esc(str(s.get("name") or ""))
+        learn = "✅" if s.get("learn") else "—"
+        alarm = "✅" if s.get("alarm") else "—"
+        block = "✅" if s.get("block") else "—"
+        body_rows.append(f"<tr><td>{name}</td><td>{learn}</td><td>{alarm}</td><td>{block}</td></tr>")
+
+    return (
+        "<table class='results sig-sets-table'>"
+        "<thead><tr><th>Signature Set</th><th>Learn</th><th>Alarm</th><th>Block</th></tr></thead>"
+        "<tbody>" + "".join(body_rows) + "</tbody>"
+        "</table>"
+    )
+
+
+def _build_audit_log_html(result: ComparisonResult) -> str:
+    logs = (result.policy_audit_logs or [])[:10]
+    if not logs:
+        return "<p class='muted'>No audit log entries available.</p>"
+
+    body_rows = []
+    for entry in logs:
+        action = _esc(str(entry.get("action") or ""))
+        username = _esc(str(entry.get("username") or ""))
+        timestamp = _esc(str(entry.get("timestamp") or ""))
+        body_rows.append(f"<tr><td>{action}</td><td>{username}</td><td>{timestamp}</td></tr>")
+
+    return (
+        "<table class='results'>"
+        "<thead><tr><th>Change / Action</th><th>User</th><th>Date / Time</th></tr></thead>"
+        "<tbody>" + "".join(body_rows) + "</tbody>"
+        "</table>"
     )
 
 
@@ -889,6 +999,14 @@ tr.tier-red a, tr.tier-amber a, tr.tier-green a{color:#fff;font-weight:bold}
 .legacy-findings th,.legacy-findings td{font-size:13px}
 .violation-compare th,.violation-compare td{font-size:12px}
 .inventory-banner{background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px 16px;color:#7a5a00;margin-bottom:12px}
+.legacy-policy-panel{margin-top:10px;border:1px solid #d9dfea;border-radius:6px;background:#fff;padding:12px 16px}
+.section-heading{margin:18px 0 8px;padding-bottom:4px;border-bottom:2px solid #d9dfea;color:#0f3460}
+.violation-cards{display:flex;gap:16px;flex-wrap:wrap}
+.vcard{flex:1;min-width:200px;border:1px solid #d9dfea;border-radius:6px;padding:10px;background:#f8fafe}
+.vcard-title{font-weight:700;margin-bottom:6px;font-size:14px}
+.vcard-title.learn{color:#0f3460}
+.vcard-title.alarm{color:#fd7e14}
+.vcard-title.block{color:#dc3545}
 """
 
 
