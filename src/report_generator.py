@@ -810,18 +810,31 @@ def _build_waf_violation_table_html(result: ComparisonResult) -> str:
 
 _DASHBOARD_CSS = """
 html{scroll-behavior:smooth}
-body{font-family:Arial,Helvetica,sans-serif;background:#f7f7fb;color:#222;padding:20px;margin:0}
+body{font-family:Arial,Helvetica,sans-serif;background:#f7f7fb;color:#222;padding:12px 20px;margin:0}
 h1{margin-top:0;margin-bottom:12px}
 h2{margin:16px 0 8px}
-.device-banner{background:linear-gradient(135deg,#0f3460,#1f4f85);color:#fff;border-radius:10px;padding:14px 16px;margin:0 0 14px;border:1px solid #0b2a4f}
-.device-banner-title{font-size:15px;font-weight:700;margin-bottom:8px;text-transform:uppercase;letter-spacing:.4px;opacity:.95}
-.device-banner-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
-.device-banner-grid .label{display:block;font-size:11px;opacity:.85;text-transform:uppercase;letter-spacing:.35px;margin-bottom:2px}
-.device-banner-grid strong{font-size:15px}
-.layout{display:flex;gap:18px;align-items:flex-start}
-.sidebar{width:320px;position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;background:#fff;border:1px solid #d9dfea;border-radius:8px;padding:12px}
+/* Topbar */
+.topbar{background:#0f3460;color:#fff;padding:10px 16px;border-radius:8px;margin-bottom:12px;display:flex;flex-wrap:wrap;align-items:center;gap:12px;justify-content:space-between}
+.top-title{font-weight:700;font-size:18px}
+.top-meta{display:flex;flex-wrap:wrap;gap:14px;font-size:13px}
+/* Shell layout — sidebar + main side by side */
+.shell{display:flex;gap:18px;align-items:flex-start}
+.sidebar{width:280px;flex-shrink:0;position:sticky;top:12px;max-height:calc(100vh - 24px);overflow-y:auto;background:#fff;border:1px solid #d9dfea;border-radius:8px;padding:12px}
 .main{flex:1;min-width:0}
-.policy-nav{display:flex;flex-direction:column;gap:10px}
+/* View visibility — all views hidden; only .active shown */
+.view{display:none}
+.view.active{display:block}
+/* Nav items */
+.policy-nav{display:flex;flex-direction:column;gap:6px}
+.nav-group-title{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#7a8fa6;font-weight:700;padding:8px 4px 2px;margin-top:2px}
+.nav-item{display:block;width:100%;text-align:left;padding:8px 10px;border:1px solid #d8deeb;border-radius:6px;background:#f8fafe;cursor:pointer;font:inherit;font-size:13px;color:#1f2b3d;transition:border-color .15s,box-shadow .15s;appearance:none;-webkit-appearance:none;box-sizing:border-box}
+.nav-item:hover{border-color:#5b77ad;box-shadow:0 0 0 2px rgba(15,52,96,.12)}
+.nav-item.active{border-color:#0f3460;background:#e6edf7;box-shadow:0 0 0 2px rgba(15,52,96,.2);font-weight:700}
+.nav-policy{display:flex;flex-direction:column;gap:2px}
+.nav-policy-path{font-weight:600;word-break:break-all;font-size:13px}
+.nav-policy-meta{font-size:11px;color:#5f6570}
+.nav-item.active .nav-policy-meta{color:#2a4a7f}
+/* Legacy card classes kept for back-compat */
 .policy-card{display:block;text-decoration:none;color:#1f2b3d;border:1px solid #d8deeb;border-radius:8px;background:#f8fafe;padding:10px;transition:border-color .15s,box-shadow .15s;cursor:pointer;font:inherit;text-align:left;width:100%;appearance:none;-webkit-appearance:none}
 .policy-card:hover{border-color:#5b77ad;box-shadow:0 0 0 2px rgba(15,52,96,.15)}
 .policy-card.active{border-color:#0f3460;box-shadow:0 0 0 2px rgba(15,52,96,.25)}
@@ -834,17 +847,33 @@ h2{margin:16px 0 8px}
 .status-review{background:#ffe8a1;color:#7a5a00}
 .mode-blocking{background:#d4edda;color:#155724}
 .mode-transparent{background:#ffe9a8;color:#7a5a00}
+/* Status badges for VS table */
+.status-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700}
+.status-enabled{background:#d4edda;color:#155724}
+.status-capable{background:#cce5ff;color:#004085}
+.status-na{background:#e9ecef;color:#495057}
 .summary-card{background:#eef5ff}
-.detail-view{display:none}
 table.results{border-collapse:collapse;width:100%;background:#fff;border:1px solid #ddd}
 table.results th,table.results td{padding:10px;border-bottom:1px solid #eee;text-align:left}
 table.results th{background:#0f3460;color:#fff}
+table.results.nested th{background:#2a5a8c}
 tr.tier-red{background:#dc3545;color:#fff}
 tr.tier-amber{background:#fd7e14;color:#fff}
 tr.tier-yellow{background:#ffc107;color:#000}
 tr.tier-green{background:#28a745;color:#fff}
 tr.tier-yellow td{border-color:#f5d86a}
 tr.tier-red a, tr.tier-amber a, tr.tier-green a{color:#fff;font-weight:bold}
+/* VS table controls */
+.expand-col{width:32px}
+.vs-toggle{background:none;border:1px solid #b0b8cb;border-radius:4px;width:22px;height:22px;cursor:pointer;font-weight:bold;font-size:14px;line-height:1;padding:0;color:#0f3460}
+.vs-toggle:hover{background:#e6edf7}
+.vs-detail-row>td{background:#f3f6fc;border-top:2px solid #d9dfea;padding:0}
+.vs-detail-panel{padding:10px 14px}
+.vs-controls{margin-bottom:10px;display:flex;align-items:center;gap:8px}
+.vs-controls label{font-size:13px;font-weight:600}
+.vs-controls input{padding:6px 10px;border:1px solid #d9dfea;border-radius:4px;font-size:13px;width:300px}
+.sort-btn{background:none;border:none;cursor:pointer;font-weight:700;color:#fff;padding:0;font:inherit;font-size:inherit}
+.sort-btn:hover{text-decoration:underline}
 .summary-bar{display:flex;gap:12px;margin:12px 0;font-weight:bold}
 .summary-bar span{padding:6px 10px;border-radius:4px;color:#fff}
 .summary-bar .tier-red{background:#dc3545}
@@ -859,6 +888,7 @@ tr.tier-red a, tr.tier-amber a, tr.tier-green a{color:#fff;font-weight:bold}
 .legacy-summary{max-width:420px;margin-bottom:10px}
 .legacy-findings th,.legacy-findings td{font-size:13px}
 .violation-compare th,.violation-compare td{font-size:12px}
+.inventory-banner{background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px 16px;color:#7a5a00;margin-bottom:12px}
 """
 
 
