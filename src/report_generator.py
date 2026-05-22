@@ -391,7 +391,8 @@ def generate_html_dashboard(
         "var tpl=document.getElementById('tpl-'+viewId);"
         "if(!tpl){return;}"
         "detail.innerHTML=tpl.innerHTML;"
-        "setActive('detail-view');"
+        "navItems.forEach(function(item){item.classList.toggle('active',item.getAttribute('data-view')===viewId);});"
+        "views.forEach(function(view){view.classList.toggle('active',view.id==='detail-view');});"
         "window.location.hash=viewId;"
         "window.scrollTo({top:0,behavior:'smooth'});"
         "}"
@@ -689,10 +690,11 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
     raw_score = f"{result.raw_score:.1f}%" if result.is_hard_fail else "—"
     cb_text = ", ".join(result.circuit_breakers_triggered) if result.circuit_breakers_triggered else "None"
     section_id_attr = f" id='{_esc(section_id)}'" if section_id else ""
+    tier_emoji = _TIER_EMOJI.get(result.tier, "")
     return "".join([
-        f"<details class='legacy-policy'{section_id_attr}>",
-        f"<summary><strong>{_esc(result.policy_path)}</strong> — {_TIER_EMOJI.get(result.tier,'')} {_esc(result.tier_label)} ({result.score:.1f}%)</summary>",
-        "<div class='details-body'>",
+        f"<div class='policy-detail-content'{section_id_attr}>",
+        f"<h2>{_esc(result.policy_path)}</h2>",
+        f"<p class='policy-detail-tier'>{tier_emoji} <strong>{_esc(result.tier_label)}</strong> &mdash; Score: {result.score:.1f}%</p>",
         "<table class='results legacy-meta'><tbody>",
         f"<tr><th>Partition</th><td>{_esc(result.partition)}</td><th>Enforcement Mode</th><td>{_esc(result.enforcement_mode)}</td></tr>",
         f"<tr><th>Baseline</th><td>{_esc(result.baseline_name)}</td><th>Audit Date</th><td>{_esc(result.timestamp)}</td></tr>",
@@ -704,7 +706,7 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
         f"{summary_rows}</tbody></table>",
         violation_section,
         "".join(finding_sections),
-        "</div></details>",
+        "</div>",
     ])
 
 
@@ -905,10 +907,13 @@ tr.tier-red a,tr.tier-amber a,tr.tier-green a{color:#fff;font-weight:bold}
 .mode-transparent{background:#ffe9a8;color:#7a5a00}
 .policy-mode,.policy-status{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700}
 
-/* ── Legacy per-policy details ────────────────────────────────────────────── */
+/* ── Per-policy detail view ───────────────────────────────────────────────── */
+.policy-detail-content{padding-bottom:20px}
+.policy-detail-tier{font-size:15px;margin:4px 0 14px;color:#1f3a5c}
+.details-body{padding:10px 12px}
+/* legacy wrapper kept for inner finding accordions */
 .legacy-policy{margin-top:10px;border:1px solid #d9dfea;border-radius:6px;background:#fff}
 .legacy-policy>summary{cursor:pointer;padding:10px 12px;font-weight:bold;background:#f3f6fc}
-.details-body{padding:10px 12px}
 .legacy-meta th{width:180px;background:#f8fafe;color:#22314f}
 .legacy-summary{max-width:420px;margin-bottom:10px}
 .legacy-findings th,.legacy-findings td{font-size:13px}
