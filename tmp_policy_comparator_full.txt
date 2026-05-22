@@ -1,0 +1,852 @@
+0001: """
+0002: Policy comparison (diff) engine.
+0003: 
+0004: Compares a parsed target policy against a parsed baseline policy and
+0005: produces a ComparisonResult with severity-annotated DiffItem entries and
+0006: a compliance score.
+0007: """
+0008: from __future__ import annotations
+0009: 
+0010: from dataclasses import dataclass, field
+0011: from typing import Any, Dict, List, Optional
+0012: 
+0013: from .utils import get_logger, iso_timestamp
+0014: 
+0015: _log = get_logger("policy_comparator")
+0016: 
+0017: SEVERITY_CRITICAL = "critical"
+0018: SEVERITY_WARNING  = "warning"
+0019: SEVERITY_INFO     = "info"
+0020: 
+0021: # Scoring deductions per severity
+0022: _DEDUCT = {
+0023:     SEVERITY_CRITICAL: 5.0,
+0024:     SEVERITY_WARNING:  2.0,
+0025:     SEVERITY_INFO:     0.5,
+0026: }
+0027: 
+0028: 
+0029: # ── Data structures ────────────────────────────────────────────────────────────
+0030: 
+0031: @dataclass
+0032: class DiffItem:
+0033:     section:        str
+0034:     element_name:   str
+0035:     attribute:      str
+0036:     baseline_value: Any
+0037:     target_value:   Any
+0038:     severity:       str
+0039:     description:    str
+0040: 
+0041: 
+0042: @dataclass
+0043: class ComparisonResult:
+0044:     policy_name:     str
+0045:     policy_path:     str
+0046:     partition:       str
+0047:     enforcement_mode: str
+0048:     baseline_name:   str
+0049:     timestamp:       str
+0050:     summary:         Dict   = field(default_factory=dict)
+0051:     diffs:           List[DiffItem] = field(default_factory=list)
+0052:     missing_in_target: List = field(default_factory=list)
+0053:     extra_in_target:   List = field(default_factory=list)
+0054:     score:           float = 100.0
+0055:     violations:      List[Dict] = field(default_factory=list)
+0056:     baseline_violations: List[Dict] = field(default_factory=list)
+0057:     policy_builder_target:   Dict = field(default_factory=dict)
+0058:     policy_builder_baseline: Dict = field(default_factory=dict)
+0059:     # Virtual server(s) this policy is applied to (populated from LTM API)
+0060:     virtual_servers: List[Dict] = field(default_factory=list)
+0061:     # Source BIG-IP device identity (hostname from sys/global-settings, mgmt IP from connection)
+0062:     device_hostname: str = ""
+0063:     device_mgmt_ip:  str = ""
+0064:     # Raw signature set lists for inventory reporting (Learn / Alarm / Block per set)
+0065:     target_signature_sets:   List[Dict] = field(default_factory=list)
+0066:     baseline_signature_sets: List[Dict] = field(default_factory=list)
+0067:     # Audit mode: "waf" (ASM/AWAF policy) or "bot" (Bot Defense profile)
+0068:     profile_type: str = "waf"
+0069:     # Bot Defense display data — populated by bot_defense_comparator
+0070:     bot_mitigation_target:   Dict = field(default_factory=dict)
+0071:     bot_mitigation_baseline: Dict = field(default_factory=dict)
+0072:     bot_signatures:  List[Dict] = field(default_factory=list)
+0073:     bot_whitelist:   List[Dict] = field(default_factory=list)
+0074:     bot_browsers:    List[Dict] = field(default_factory=list)
+0075:     bot_overrides:   List[Dict] = field(default_factory=list)
+0076:     # Recent ASM policy change history (from /audit-logs)
+0077:     policy_audit_logs: List[Dict] = field(default_factory=list)
+0078:     # Recent ASM security policy change history (from /audit-logs)
+0079:     asm_audit_logs: List[Dict] = field(default_factory=list)
+0080: 
+0081: 
+0082: # ── Main entry point ───────────────────────────────────────────────────────────
+0083: 
+0084: def compare_policies(
+0085:     baseline: Dict,
+0086:     target: Dict,
+0087:     policy_meta: Optional[Dict] = None,
+0088:     baseline_name: str = "baseline",
+0089:     virtual_servers: Optional[List[Dict]] = None,
+0090:     device_hostname: str = "",
+0091:     device_mgmt_ip:  str = "",
+0092:     policy_audit_logs: Optional[List[Dict]] = None,
+0093:     asm_audit_logs: Optional[List[Dict]] = None,
+0094: ) -> ComparisonResult:
+0095:     """
+0096:     Compare a target policy dict against a baseline policy dict.
+0097: 
+0098:     Both dicts must come from policy_parser.parse_policy().
+0099:     policy_meta is the result of policy_parser.get_policy_metadata() for target.
+0100:     virtual_servers is a list of dicts produced by PolicyExporter.enrich_with_virtual_servers().
+0101:     device_hostname / device_mgmt_ip identify the BIG-IP the policy was exported from.
+0102:     policy_audit_logs is a list of recent policy change entries from
+0103:     /mgmt/tm/asm/policies/<id>/audit-logs.
+0104:     """
+0105:     meta = policy_meta or {}
+0106:     result = ComparisonResult(
+0107:         policy_name=meta.get("name", "unknown"),
+0108:         policy_path=meta.get("fullPath", "unknown"),
+0109:         partition=meta.get("fullPath", "/Common/unknown").strip('/').split('/')[0],
+0110:         enforcement_mode=target.get("general", {}).get("enforcementMode", "transparent"),
+0111:         baseline_name=baseline_name,
+0112:         timestamp=iso_timestamp(),
+0113:         virtual_servers=virtual_servers or [],
+0114:         device_hostname=device_hostname,
+0115:         policy_audit_logs=policy_audit_logs or [],
+0116:         device_mgmt_ip=device_mgmt_ip,
+0117:         asm_audit_logs=asm_audit_logs or [],
+0118:     )
+0119: 
+0120:     # Run each section comparator
+0121:     _cmp_general(baseline, target, result)
+0122:     _cmp_blocking_settings(baseline, target, result)
+0123:     _cmp_attack_signatures(baseline, target, result)
+0124:     _cmp_signature_sets(baseline, target, result)
+0125:     _cmp_named_list(
+0126:         baseline.get("urls", []),
+0127:         target.get("urls", []),
+0128:         section="urls",
+0129:         key="name",
+0130:         attrs=["isAllowed", "attackSignaturesCheck", "metacharsOnUrlCheck"],
+0131:         result=result,
+0132:     )
+0133:     _cmp_named_list(
+0134:         baseline.get("filetypes", []),
+0135:         target.get("filetypes", []),
+0136:         section="filetypes",
+0137:         key="name",
+0138:         attrs=["allowed", "responseCheck"],
+0139:         result=result,
+0140:     )
+0141:     _cmp_named_list(
+0142:         baseline.get("parameters", []),
+0143:         target.get("parameters", []),
+0144:         section="parameters",
+0145:         key="name",
+0146:         attrs=["allowEmptyValue", "checkAttackSignatures", "checkMetachars", "sensitiveParameter"],
+0147:         result=result,
+0148:     )
+0149:     _cmp_named_list(
+0150:         baseline.get("headers", []),
+0151:         target.get("headers", []),
+0152:         section="headers",
+0153:         key="name",
+0154:         attrs=["mandatory", "checkSignatures"],
+0155:         result=result,
+0156:     )
+0157:     _cmp_named_list(
+0158:         baseline.get("cookies", []),
+0159:         target.get("cookies", []),
+0160:         section="cookies",
+0161:         key="name",
+0162:         attrs=["enforcementType", "insertSameSiteAttribute", "decodeValueAsBase64"],
+0163:         result=result,
+0164:     )
+0165:     _cmp_named_list(
+0166:         baseline.get("methods", []),
+0167:         target.get("methods", []),
+0168:         section="methods",
+0169:         key="name",
+0170:         attrs=["actAsMethod"],
+0171:         result=result,
+0172:     )
+0173:     _cmp_data_guard(baseline, target, result)
+0174:     _cmp_ip_intelligence(baseline, target, result)
+0175:     _cmp_bot_defense(baseline, target, result)
+0176:     _cmp_whitelist_ips(baseline, target, result)
+0177: 
+0178:     _cmp_blocking(baseline, target, result)
+0179:     _cmp_policy_builder(baseline, target, result)
+0180: 
+0181:     # Capture violations for status reporting: prefer the richer <blocking> list,
+0182:     # fall back to <blocking-settings> violations.
+0183:     blocking_violations = target.get("blocking", {}).get("violations", [])
+0184:     result.violations = blocking_violations or target.get("blocking-settings", {}).get("violations", [])
+0185: 
+0186:     # Capture baseline violations for side-by-side comparison in reports.
+0187:     baseline_blocking_violations = baseline.get("blocking", {}).get("violations", [])
+0188:     result.baseline_violations = baseline_blocking_violations or baseline.get("blocking-settings", {}).get("violations", [])
+0189: 
+0190:     # Build summary and calculate score
+0191:     _build_summary(result)
+0192:     result.score = _calculate_score(result.diffs)
+0193: 
+0194:     return result
+0195: 
+0196: 
+0197: # ── Section comparators ────────────────────────────────────────────────────────
+0198: 
+0199: def _add(result: ComparisonResult, item: DiffItem) -> None:
+0200:     result.diffs.append(item)
+0201: 
+0202: 
+0203: def _cmp_general(baseline: Dict, target: Dict, result: ComparisonResult) -> None:
+0204:     b_gen = baseline.get("general", {})
+0205:     t_gen = target.get("general", {})
+0206: 
+0207:     # enforcementMode: baseline=blocking, target=transparent → CRITICAL
+0208:     b_mode = b_gen.get("enforcementMode", "transparent")
+0209:     t_mode = t_gen.get("enforcementMode", "transparent")
+0210:     if b_mode != t_mode:
+0211:         sev = SEVERITY_CRITICAL if (b_mode == "blocking" and t_mode != "blocking") else SEVERITY_WARNING
+0212:         _add(result, DiffItem(
+0213:             section="general",
+0214:             element_name="enforcementMode",
+0215:             attribute="enforcementMode",
+0216:             baseline_value=b_mode,
+0217:             target_value=t_mode,
+0218:             severity=sev,
+0219:             description=(
+0220:                 "Policy enforcement mode differs from baseline. "
+0221:                 f"Baseline: {b_mode}, Target: {t_mode}."
+0222:                 + (" Policy is NOT blocking threats." if sev == SEVERITY_CRITICAL else "")
+0223:             ),
+0224:         ))
+0225: 
+0226:     # Simple boolean/string settings
+0227:     _simple_attrs = [
+0228:         ("signatureStaging",      SEVERITY_WARNING,  "Signature staging setting differs."),
+0229:         ("responseLogging",       SEVERITY_INFO,     "Response logging setting differs."),
+0230:         ("maskCreditCardNumbers", SEVERITY_WARNING,  "Credit card masking setting differs."),
+0231:         ("trustXff",              SEVERITY_WARNING,  "Trust X-Forwarded-For setting differs."),
+0232:     ]
+0233:     for attr, sev, desc in _simple_attrs:
+0234:         b_val = b_gen.get(attr)
+0235:         t_val = t_gen.get(attr)
+0236:         if b_val is not None and b_val != t_val:
+0237:             _add(result, DiffItem(
+0238:                 section="general",
+0239:                 element_name=attr,
+0240:                 attribute=attr,
+0241:                 baseline_value=b_val,
+0242:                 target_value=t_val,
+0243:                 severity=sev,
+0244:                 description=desc,
+0245:             ))
+0246: 
+0247: 
+0248: def _cmp_blocking_settings(
+0249:     baseline: Dict, target: Dict, result: ComparisonResult
+0250: ) -> None:
+0251:     b_bs = baseline.get("blocking-settings", {})
+0252:     t_bs = target.get("blocking-settings", {})
+0253: 
+0254:     for sub_section in ("violations", "evasions", "http-protocols"):
+0255:         b_items = {item["name"]: item for item in b_bs.get(sub_section, [])}
+0256:         t_items = {item["name"]: item for item in t_bs.get(sub_section, [])}
+0257:         section_key = f"blocking-settings.{sub_section}"
+0258: 
+0259:         for name, b_item in b_items.items():
+0260:             if name not in t_items:
+0261:                 result.missing_in_target.append(
+0262:                     {"section": section_key, "name": name}
+0263:                 )
+0264:                 _add(result, DiffItem(
+0265:                     section=section_key,
+0266:                     element_name=name,
+0267:                     attribute="(all)",
+0268:                     baseline_value="present",
+0269:                     target_value="missing",
+0270:                     severity=SEVERITY_WARNING,
+0271:                     description=f"'{name}' is defined in baseline but missing from target policy.",
+0272:                 ))
+0273:                 continue
+0274: 
+0275:             t_item = t_items[name]
+0276:             for attr in ("alarm", "block", "learn"):
+0277:                 b_val = b_item.get(attr)
+0278:                 t_val = t_item.get(attr)
+0279:                 if b_val != t_val:
+0280:                     # block=True in baseline but False in target → CRITICAL
+0281:                     sev = (
+0282:                         SEVERITY_CRITICAL
+0283:                         if attr == "block" and b_val is True and t_val is False
+0284:                         else SEVERITY_WARNING
+0285:                     )
+0286:                     desc = (
+0287:                         f"Protection disabled: '{name}' has block=True in baseline "
+0288:                         "but block=False in target. Attacks will NOT be blocked."
+0289:                         if sev == SEVERITY_CRITICAL
+0290:                         else f"'{name}' {attr} setting differs from baseline."
+0291:                     )
+0292:                     _add(result, DiffItem(
+0293:                         section=section_key,
+0294:                         element_name=name,
+0295:                         attribute=attr,
+0296:                         baseline_value=b_val,
+0297:                         target_value=t_val,
+0298:                         severity=sev,
+0299:                         description=desc,
+0300:                     ))
+0301: 
+0302:         for name in t_items:
+0303:             if name not in b_items:
+0304:                 result.extra_in_target.append(
+0305:                     {"section": section_key, "name": name}
+0306:                 )
+0307: 
+0308: 
+0309: def _cmp_blocking(
+0310:     baseline: Dict, target: Dict, result: ComparisonResult
+0311: ) -> None:
+0312:     """
+0313:     Compare the <blocking> section (newer AWAF export format).
+0314: 
+0315:     Each violation is keyed by its machine-readable 'id' attribute
+0316:     (e.g. 'ILLEGAL_SOAP_ATTACHMENT').  alarm, block, and learn are compared
+0317:     against baseline.  policyBuilderTracking differences are flagged as INFO.
+0318:     """
+0319:     b_bl = baseline.get("blocking", {})
+0320:     t_bl = target.get("blocking", {})
+0321: 
+0322:     if not b_bl and not t_bl:
+0323:         return  # Section absent in both — nothing to compare
+0324: 
+0325:     # Section-level enforcement_mode comparison
+0326:     b_em = b_bl.get("enforcement_mode", "")
+0327:     t_em = t_bl.get("enforcement_mode", "")
+0328:     if b_em and t_em and b_em != t_em:
+0329:         sev = (
+0330:             SEVERITY_CRITICAL
+0331:             if b_em == "blocking" and t_em != "blocking"
+0332:             else SEVERITY_WARNING
+0333:         )
+0334:         _add(result, DiffItem(
+0335:             section="blocking",
+0336:             element_name="enforcement_mode",
+0337:             attribute="enforcement_mode",
+0338:             baseline_value=b_em,
+0339:             target_value=t_em,
+0340:             severity=sev,
+0341:             description=(
+0342:                 f"Blocking section enforcement mode changed from '{b_em}' to '{t_em}'."
+0343:                 + (" Violations will NOT be blocked." if sev == SEVERITY_CRITICAL else "")
+0344:             ),
+0345:         ))
+0346: 
+0347:     b_viols = {v["id"] or v["name"]: v for v in b_bl.get("violations", [])}
+0348:     t_viols = {v["id"] or v["name"]: v for v in t_bl.get("violations", [])}
+0349: 
+0350:     if not b_viols:
+0351:         # No baseline violations to compare against — track extras only
+0352:         for vid in t_viols:
+0353:             result.extra_in_target.append({"section": "blocking", "id": vid})
+0354:         return
+0355: 
+0356:     for vid, b_viol in b_viols.items():
+0357:         display = b_viol.get("name") or vid
+0358: 
+0359:         if vid not in t_viols:
+0360:             result.missing_in_target.append({"section": "blocking", "id": vid, "name": display})
+0361:             _add(result, DiffItem(
+0362:                 section="blocking",
+0363:                 element_name=vid,
+0364:                 attribute="(all)",
+0365:                 baseline_value="present",
+0366:                 target_value="missing",
+0367:                 severity=SEVERITY_WARNING,
+0368:                 description=f"Blocking violation '{display}' ({vid}) is in baseline but absent from target.",
+0369:             ))
+0370:             continue
+0371: 
+0372:         t_viol = t_viols[vid]
+0373: 
+0374:         # Compare alarm / block / learn
+0375:         for attr in ("alarm", "block", "learn"):
+0376:             b_val = b_viol.get(attr)
+0377:             t_val = t_viol.get(attr)
+0378:             if b_val != t_val:
+0379:                 sev = (
+0380:                     SEVERITY_CRITICAL
+0381:                     if attr == "block" and b_val is True and t_val is False
+0382:                     else SEVERITY_WARNING
+0383:                 )
+0384:                 desc = (
+0385:                     f"Protection disabled: violation '{display}' ({vid}) has block=True "
+0386:                     "in baseline but block=False in target. Attacks will NOT be blocked."
+0387:                     if sev == SEVERITY_CRITICAL
+0388:                     else f"Violation '{display}' ({vid}) '{attr}' setting differs from baseline."
+0389:                 )
+0390:                 _add(result, DiffItem(
+0391:                     section="blocking",
+0392:                     element_name=vid,
+0393:                     attribute=attr,
+0394:                     baseline_value=b_val,
+0395:                     target_value=t_val,
+0396:                     severity=sev,
+0397:                     description=desc,
+0398:                 ))
+0399: 
+0400:         # policyBuilderTracking differences are informational
+0401:         b_pbt = b_viol.get("policyBuilderTracking")
+0402:         t_pbt = t_viol.get("policyBuilderTracking")
+0403:         if b_pbt is not None and b_pbt != t_pbt:
+0404:             _add(result, DiffItem(
+0405:                 section="blocking",
+0406:                 element_name=vid,
+0407:                 attribute="policyBuilderTracking",
+0408:                 baseline_value=b_pbt,
+0409:                 target_value=t_pbt,
+0410:                 severity=SEVERITY_INFO,
+0411:                 description=f"Violation '{display}' ({vid}) policy builder tracking setting differs.",
+0412:             ))
+0413: 
+0414:     for vid in t_viols:
+0415:         if vid not in b_viols:
+0416:             result.extra_in_target.append({"section": "blocking", "id": vid,
+0417:                                            "name": t_viols[vid].get("name", vid)})
+0418: 
+0419: 
+0420: def _cmp_attack_signatures(
+0421:     baseline: Dict, target: Dict, result: ComparisonResult
+0422: ) -> None:
+0423:     b_sigs = {s["signatureId"]: s for s in baseline.get("attack-signatures", [])}
+0424:     t_sigs = {s["signatureId"]: s for s in target.get("attack-signatures", [])}
+0425: 
+0426:     if not b_sigs:
+0427:         return
+0428: 
+0429:     matched = missing = disabled = staging = 0
+0430: 
+0431:     for sig_id, b_sig in b_sigs.items():
+0432:         if sig_id not in t_sigs:
+0433:             missing += 1
+0434:             result.missing_in_target.append(
+0435:                 {"section": "attack-signatures", "signatureId": sig_id}
+0436:             )
+0437:             continue
+0438: 
+0439:         t_sig = t_sigs[sig_id]
+0440:         matched += 1
+0441: 
+0442:         if b_sig.get("enabled") and not t_sig.get("enabled"):
+0443:             disabled += 1
+0444:             _add(result, DiffItem(
+0445:                 section="attack-signatures",
+0446:                 element_name=str(sig_id),
+0447:                 attribute="enabled",
+0448:                 baseline_value=True,
+0449:                 target_value=False,
+0450:                 severity=SEVERITY_CRITICAL,
+0451:                 description=f"Signature {sig_id} is enabled in baseline but disabled in target.",
+0452:             ))
+0453: 
+0454:         if not b_sig.get("performStaging") and t_sig.get("performStaging"):
+0455:             staging += 1
+0456:             _add(result, DiffItem(
+0457:                 section="attack-signatures",
+0458:                 element_name=str(sig_id),
+0459:                 attribute="performStaging",
+0460:                 baseline_value=False,
+0461:                 target_value=True,
+0462:                 severity=SEVERITY_WARNING,
+0463:                 description=(
+0464:                     f"Signature {sig_id} is active in baseline but still in staging "
+0465:                     "in target (will not enforce)."
+0466:                 ),
+0467:             ))
+0468: 
+0469:     for sig_id in t_sigs:
+0470:         if sig_id not in b_sigs:
+0471:             result.extra_in_target.append(
+0472:                 {"section": "attack-signatures", "signatureId": sig_id}
+0473:             )
+0474: 
+0475:     _log.debug(
+0476:         "Signature comparison: %d matched, %d missing, %d disabled, %d staging.",
+0477:         matched, missing, disabled, staging,
+0478:     )
+0479: 
+0480: 
+0481: def _cmp_signature_sets(
+0482:     baseline: Dict, target: Dict, result: ComparisonResult
+0483: ) -> None:
+0484:     b_sets = {s["name"]: s for s in baseline.get("signature-sets", [])}
+0485:     t_sets = {s["name"]: s for s in target.get("signature-sets", [])}
+0486: 
+0487:     # Store raw lists for inventory reporting
+0488:     result.target_signature_sets   = target.get("signature-sets", [])
+0489:     result.baseline_signature_sets = baseline.get("signature-sets", [])
+0490: 
+0491:     for name, b_set in b_sets.items():
+0492:         if name not in t_sets:
+0493:             result.missing_in_target.append({"section": "signature-sets", "name": name})
+0494:             _add(result, DiffItem(
+0495:                 section="signature-sets",
+0496:                 element_name=name,
+0497:                 attribute="(all)",
+0498:                 baseline_value="present",
+0499:                 target_value="missing",
+0500:                 severity=SEVERITY_WARNING,
+0501:                 description=f"Signature set '{name}' is in baseline but missing from target.",
+0502:             ))
+0503:             continue
+0504: 
+0505:         t_set = t_sets[name]
+0506:         for attr in ("alarm", "block", "learn"):
+0507:             b_val = b_set.get(attr)
+0508:             t_val = t_set.get(attr)
+0509:             if b_val != t_val:
+0510:                 sev = (
+0511:                     SEVERITY_CRITICAL
+0512:                     if attr == "block" and b_val is True and t_val is False
+0513:                     else SEVERITY_WARNING
+0514:                 )
+0515:                 _add(result, DiffItem(
+0516:                     section="signature-sets",
+0517:                     element_name=name,
+0518:                     attribute=attr,
+0519:                     baseline_value=b_val,
+0520:                     target_value=t_val,
+0521:                     severity=sev,
+0522:                     description=f"Signature set '{name}' {attr} differs from baseline.",
+0523:                 ))
+0524: 
+0525:     for name in t_sets:
+0526:         if name not in b_sets:
+0527:             result.extra_in_target.append({"section": "signature-sets", "name": name})
+0528: 
+0529: 
+0530: def _cmp_named_list(
+0531:     b_list: List[Dict],
+0532:     t_list: List[Dict],
+0533:     section: str,
+0534:     key: str,
+0535:     attrs: List[str],
+0536:     result: ComparisonResult,
+0537:     missing_severity: str = SEVERITY_WARNING,
+0538:     attr_severity: str = SEVERITY_WARNING,
+0539: ) -> None:
+0540:     b_map = {item[key]: item for item in b_list}
+0541:     t_map = {item[key]: item for item in t_list}
+0542: 
+0543:     for name, b_item in b_map.items():
+0544:         if name not in t_map:
+0545:             result.missing_in_target.append({"section": section, key: name})
+0546:             _add(result, DiffItem(
+0547:                 section=section,
+0548:                 element_name=name,
+0549:                 attribute="(all)",
+0550:                 baseline_value="present",
+0551:                 target_value="missing",
+0552:                 severity=missing_severity,
+0553:                 description=f"{section} '{name}' defined in baseline is missing from target.",
+0554:             ))
+0555:             continue
+0556: 
+0557:         t_item = t_map[name]
+0558:         for attr in attrs:
+0559:             b_val = b_item.get(attr)
+0560:             t_val = t_item.get(attr)
+0561:             if b_val is not None and b_val != t_val:
+0562:                 _add(result, DiffItem(
+0563:                     section=section,
+0564:                     element_name=name,
+0565:                     attribute=attr,
+0566:                     baseline_value=b_val,
+0567:                     target_value=t_val,
+0568:                     severity=attr_severity,
+0569:                     description=f"{section} '{name}' attribute '{attr}' differs from baseline.",
+0570:                 ))
+0571: 
+0572:     for name in t_map:
+0573:         if name not in b_map:
+0574:             result.extra_in_target.append({"section": section, key: name})
+0575: 
+0576: 
+0577: def _cmp_data_guard(
+0578:     baseline: Dict, target: Dict, result: ComparisonResult
+0579: ) -> None:
+0580:     b_dg = baseline.get("data-guard", {})
+0581:     t_dg = target.get("data-guard", {})
+0582:     if not b_dg:
+0583:         return
+0584: 
+0585:     b_enabled = b_dg.get("enabled", False)
+0586:     t_enabled = t_dg.get("enabled", False)
+0587: 
+0588:     if b_enabled and not t_enabled:
+0589:         _add(result, DiffItem(
+0590:             section="data-guard",
+0591:             element_name="data-guard",
+0592:             attribute="enabled",
+0593:             baseline_value=True,
+0594:             target_value=False,
+0595:             severity=SEVERITY_CRITICAL,
+0596:             description="Data Guard is enabled in baseline but DISABLED in target. "
+0597:                         "Sensitive data (PII) may be exposed in responses.",
+0598:         ))
+0599:         return  # No point comparing sub-settings if DG is off
+0600: 
+0601:     for attr in ("creditCardNumbers", "socialSecurityNumbers"):
+0602:         b_val = b_dg.get(attr)
+0603:         t_val = t_dg.get(attr)
+0604:         if b_val is not None and b_val != t_val:
+0605:             _add(result, DiffItem(
+0606:                 section="data-guard",
+0607:                 element_name=attr,
+0608:                 attribute=attr,
+0609:                 baseline_value=b_val,
+0610:                 target_value=t_val,
+0611:                 severity=SEVERITY_CRITICAL if b_val else SEVERITY_WARNING,
+0612:                 description=f"Data Guard {attr} protection differs from baseline.",
+0613:             ))
+0614: 
+0615: 
+0616: def _cmp_ip_intelligence(
+0617:     baseline: Dict, target: Dict, result: ComparisonResult
+0618: ) -> None:
+0619:     b_ip = baseline.get("ip-intelligence", {})
+0620:     t_ip = target.get("ip-intelligence", {})
+0621:     if not b_ip:
+0622:         return
+0623: 
+0624:     if b_ip.get("enabled") and not t_ip.get("enabled"):
+0625:         _add(result, DiffItem(
+0626:             section="ip-intelligence",
+0627:             element_name="ip-intelligence",
+0628:             attribute="enabled",
+0629:             baseline_value=True,
+0630:             target_value=False,
+0631:             severity=SEVERITY_CRITICAL,
+0632:             description="IP Intelligence is enabled in baseline but disabled in target.",
+0633:         ))
+0634:         return
+0635: 
+0636:     b_cats = {c["name"]: c for c in b_ip.get("categories", [])}
+0637:     t_cats = {c["name"]: c for c in t_ip.get("categories", [])}
+0638: 
+0639:     for name, b_cat in b_cats.items():
+0640:         if name not in t_cats:
+0641:             result.missing_in_target.append(
+0642:                 {"section": "ip-intelligence.categories", "name": name}
+0643:             )
+0644:             continue
+0645:         t_cat = t_cats[name]
+0646:         for attr in ("alarm", "block"):
+0647:             b_val = b_cat.get(attr)
+0648:             t_val = t_cat.get(attr)
+0649:             if b_val != t_val:
+0650:                 sev = (
+0651:                     SEVERITY_CRITICAL
+0652:                     if attr == "block" and b_val and not t_val
+0653:                     else SEVERITY_WARNING
+0654:                 )
+0655:                 _add(result, DiffItem(
+0656:                     section="ip-intelligence.categories",
+0657:                     element_name=name,
+0658:                     attribute=attr,
+0659:                     baseline_value=b_val,
+0660:                     target_value=t_val,
+0661:                     severity=sev,
+0662:                     description=f"IP Intelligence category '{name}' {attr} differs from baseline.",
+0663:                 ))
+0664: 
+0665: 
+0666: def _cmp_bot_defense(
+0667:     baseline: Dict, target: Dict, result: ComparisonResult
+0668: ) -> None:
+0669:     b_bd = baseline.get("bot-defense", {})
+0670:     t_bd = target.get("bot-defense", {})
+0671:     if not b_bd:
+0672:         return
+0673: 
+0674:     if b_bd.get("enabled") and not t_bd.get("enabled"):
+0675:         _add(result, DiffItem(
+0676:             section="bot-defense",
+0677:             element_name="bot-defense",
+0678:             attribute="enabled",
+0679:             baseline_value=True,
+0680:             target_value=False,
+0681:             severity=SEVERITY_CRITICAL,
+0682:             description="Bot Defense is enabled in baseline but disabled in target.",
+0683:         ))
+0684: 
+0685: 
+0686: def _cmp_whitelist_ips(
+0687:     baseline: Dict, target: Dict, result: ComparisonResult
+0688: ) -> None:
+0689:     b_ips = {f"{ip['ipAddress']}/{ip['ipMask']}": ip
+0690:              for ip in baseline.get("whitelist-ips", [])}
+0691:     t_ips = {f"{ip['ipAddress']}/{ip['ipMask']}": ip
+0692:              for ip in target.get("whitelist-ips", [])}
+0693: 
+0694:     # IPs in target but not in baseline → WARNING (unauthorized)
+0695:     for cidr in t_ips:
+0696:         if cidr not in b_ips:
+0697:             _add(result, DiffItem(
+0698:                 section="whitelist-ips",
+0699:                 element_name=cidr,
+0700:                 attribute="ipAddress",
+0701:                 baseline_value="not present",
+0702:                 target_value=cidr,
+0703:                 severity=SEVERITY_WARNING,
+0704:                 description=f"IP/CIDR {cidr} is whitelisted in target but not in baseline. "
+0705:                             "Potentially unauthorized exception.",
+0706:             ))
+0707:             result.extra_in_target.append({"section": "whitelist-ips", "ip": cidr})
+0708: 
+0709:     # IPs in baseline but not in target → INFO
+0710:     for cidr in b_ips:
+0711:         if cidr not in t_ips:
+0712:             _add(result, DiffItem(
+0713:                 section="whitelist-ips",
+0714:                 element_name=cidr,
+0715:                 attribute="ipAddress",
+0716:                 baseline_value=cidr,
+0717:                 target_value="not present",
+0718:                 severity=SEVERITY_INFO,
+0719:                 description=f"IP/CIDR {cidr} is in baseline whitelist but missing from target.",
+0720:             ))
+0721:             result.missing_in_target.append({"section": "whitelist-ips", "ip": cidr})
+0722: 
+0723: 
+0724: def _cmp_pb_sub(
+0725:     b_pb: Dict, t_pb: Dict, result: ComparisonResult,
+0726:     sub_key: str, attrs_sevs: List,
+0727: ) -> None:
+0728:     b_sub = b_pb.get(sub_key, {})
+0729:     t_sub = t_pb.get(sub_key, {})
+0730:     if not b_sub:
+0731:         return
+0732:     for attr, sev in attrs_sevs:
+0733:         b_val = b_sub.get(attr)
+0734:         t_val = t_sub.get(attr)
+0735:         if b_val is not None and b_val != t_val:
+0736:             _add(result, DiffItem(
+0737:                 section=f"policy-builder.{sub_key}",
+0738:                 element_name=attr,
+0739:                 attribute=attr,
+0740:                 baseline_value=b_val,
+0741:                 target_value=t_val,
+0742:                 severity=sev,
+0743:                 description=f"Policy Builder {sub_key} '{attr}' differs from baseline.",
+0744:             ))
+0745: 
+0746: 
+0747: def _cmp_policy_builder(
+0748:     baseline: Dict, target: Dict, result: ComparisonResult
+0749: ) -> None:
+0750:     """Compare <policy_builder> and sibling sections against baseline."""
+0751:     b_pb = baseline.get("policy-builder", {})
+0752:     t_pb = target.get("policy-builder", {})
+0753: 
+0754:     result.policy_builder_target   = t_pb
+0755:     result.policy_builder_baseline = b_pb
+0756: 
+0757:     if not b_pb:
+0758:         return  # No baseline to compare against
+0759: 
+0760:     flat_checks = [
+0761:         ("learningMode",              SEVERITY_WARNING,  "Policy Builder learning mode differs from baseline."),
+0762:         ("fullyAutomatic",            SEVERITY_WARNING,  "Policy Builder fully-automatic setting differs from baseline."),
+0763:         ("clientSidePolicyBuilding",  SEVERITY_INFO,     "Client-side policy building setting differs from baseline."),
+0764:         ("learnFromResponses",        SEVERITY_INFO,     "Learn-from-responses setting differs from baseline."),
+0765:         ("learnInactiveEntities",     SEVERITY_INFO,     "Learn-inactive-entities setting differs from baseline."),
+0766:         ("enableFullPolicyInspection",SEVERITY_WARNING,  "Enable-full-policy-inspection setting differs from baseline."),
+0767:         ("autoApplyFrequency",        SEVERITY_WARNING,  "Auto-apply frequency differs from baseline."),
+0768:         ("learnOnlyFromNonBotTraffic",SEVERITY_INFO,     "Learn-only-from-non-bot-traffic setting differs from baseline."),
+0769:         ("allTrustedIps",             SEVERITY_INFO,     "All-trusted-IPs source setting differs from baseline."),
+0770:     ]
+0771:     for key, sev, desc in flat_checks:
+0772:         b_val = b_pb.get(key)
+0773:         t_val = t_pb.get(key)
+0774:         if b_val is not None and b_val != t_val:
+0775:             _add(result, DiffItem(
+0776:                 section="policy-builder",
+0777:                 element_name=key,
+0778:                 attribute=key,
+0779:                 baseline_value=b_val,
+0780:                 target_value=t_val,
+0781:                 severity=sev,
+0782:                 description=desc,
+0783:             ))
+0784: 
+0785:     _cmp_pb_sub(b_pb, t_pb, result, "cookie", [
+0786:         ("learnCookies",                  SEVERITY_WARNING),
+0787:         ("maximumAllowedModifiedCookies", SEVERITY_INFO),
+0788:         ("collapseCookies",               SEVERITY_INFO),
+0789:         ("enforceUnmodifiedCookies",      SEVERITY_INFO),
+0790:     ])
+0791:     _cmp_pb_sub(b_pb, t_pb, result, "filetype", [
+0792:         ("learnFileTypes",  SEVERITY_WARNING),
+0793:         ("maximumFileTypes", SEVERITY_INFO),
+0794:     ])
+0795:     _cmp_pb_sub(b_pb, t_pb, result, "parameter", [
+0796:         ("learnParameters",  SEVERITY_WARNING),
+0797:         ("parameterLevel",   SEVERITY_INFO),
+0798:         ("collapseParameters", SEVERITY_INFO),
+0799:         ("classifyParameters", SEVERITY_INFO),
+0800:     ])
+0801:     _cmp_pb_sub(b_pb, t_pb, result, "url", [
+0802:         ("learnUrls",          SEVERITY_WARNING),
+0803:         ("learnWebsocketUrls", SEVERITY_INFO),
+0804:         ("collapseUrls",       SEVERITY_INFO),
+0805:         ("classifyUrls",       SEVERITY_INFO),
+0806:     ])
+0807:     _cmp_pb_sub(b_pb, t_pb, result, "header", [
+0808:         ("validHostNames", SEVERITY_INFO),
+0809:     ])
+0810:     _cmp_pb_sub(b_pb, t_pb, result, "redirectionProtection", [
+0811:         ("learnRedirectionDomains", SEVERITY_WARNING),
+0812:     ])
+0813:     _cmp_pb_sub(b_pb, t_pb, result, "sessionsAndLogins", [
+0814:         ("learnLoginPages", SEVERITY_INFO),
+0815:     ])
+0816:     _cmp_pb_sub(b_pb, t_pb, result, "serverTechnologies", [
+0817:         ("learnServerTechnologies", SEVERITY_INFO),
+0818:     ])
+0819:     _cmp_pb_sub(b_pb, t_pb, result, "centralConfiguration", [
+0820:         ("buildingMode",         SEVERITY_INFO),
+0821:         ("eventCorrelationMode", SEVERITY_INFO),
+0822:     ])
+0823: 
+0824: 
+0825: # ── Score & summary ────────────────────────────────────────────────────────────
+0826: 
+0827: def _calculate_score(diffs: List[DiffItem]) -> float:
+0828:     deduction = sum(_DEDUCT.get(d.severity, 0) for d in diffs)
+0829:     return max(0.0, round(100.0 - deduction, 1))
+0830: 
+0831: 
+0832: def _build_summary(result: ComparisonResult) -> None:
+0833:     """Populate result.summary with per-section and per-severity counts."""
+0834:     from collections import defaultdict
+0835:     by_section: Dict[str, Dict[str, int]] = defaultdict(lambda: {"critical": 0, "warning": 0, "info": 0, "total": 0})
+0836: 
+0837:     for diff in result.diffs:
+0838:         section = diff.section.split('.')[0]
+0839:         by_section[section][diff.severity] += 1
+0840:         by_section[section]["total"] += 1
+0841: 
+0842:     totals = {"critical": 0, "warning": 0, "info": 0, "total": 0}
+0843:     for counts in by_section.values():
+0844:         for k in totals:
+0845:             totals[k] += counts[k]
+0846: 
+0847:     result.summary = {
+0848:         "by_section": dict(by_section),
+0849:         "totals": totals,
+0850:         "missing_count": len(result.missing_in_target),
+0851:         "extra_count":   len(result.extra_in_target),
+0852:     }

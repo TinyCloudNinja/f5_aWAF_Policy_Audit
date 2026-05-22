@@ -22,8 +22,15 @@ _log = get_logger("policy_parser")
 
 # ── Namespace helpers ──────────────────────────────────────────────────────────
 
-def _strip_ns(tag: str) -> str:
-    """Remove XML namespace from a tag, e.g. '{http://...}name' → 'name'."""
+def _strip_ns(tag: Any) -> str:
+    """Remove XML namespace from a tag, e.g. '{http://...}name' → 'name'.
+
+    Some XML parsers (notably lxml) can expose comment/PI nodes while iterating
+    children, where ``child.tag`` is not a string. In those cases return an
+    empty tag so namespace stripping remains safe.
+    """
+    if not isinstance(tag, str):
+        return ""
     return re.sub(r'\{[^}]+\}', '', tag)
 
 
@@ -84,8 +91,23 @@ def _parse_general(root) -> Dict:
     gen = _find(root, "general")
     if gen is None:
         return {}
+
+    # F5 exports are inconsistent between dashed and underscored element names.
+    # The general section typically uses <enforcement-mode>, but some exports
+    # emit <enforcement_mode>. Read both and only fall back to "transparent"
+    # when neither is present. This prevents masking a blocking policy as
+    # transparent in reports.
+    em_raw = _text(gen, "enforcement-mode") or _text(gen, "enforcement_mode")
+    # Note: some exports spell this as <enforcement_mode> while others use
+    # <enforcement-mode>. Capture both to avoid silently defaulting to
+    # "transparent" when the underscore variant is present.
+    enforcement_mode = (
+        _text(gen, "enforcement-mode")
+        or _text(gen, "enforcement_mode")
+        or "transparent"
+    )
     return {
-        "enforcementMode":          _text(gen, "enforcement-mode", "transparent"),
+        "enforcementMode":          enforcement_mode,
         "signatureStaging":         _norm_bool(gen, "signature-staging"),
         "placeholderSignatures":    _norm_bool(gen, "placeholder-signatures"),
         "responseLogging":          _text(gen, "response-logging", "none"),
@@ -167,6 +189,11 @@ def _parse_blocking(root) -> Dict:
 
     Returns a dict with keys: enforcement_mode, passive_mode, violations (list).
     Returns an empty dict when the section is absent.
+
+    Important: do not default enforcement_mode to "transparent" when the
+    <blocking> section omits it. Some exports only define mode in
+    <general>/<enforcement-mode>, and a transparent default here can mask a
+    truly blocking policy in downstream reporting.
     """
     bl = _find(root, "blocking")
     if bl is None:
@@ -176,7 +203,7 @@ def _parse_blocking(root) -> Dict:
     pm_raw  = _text(bl, "passive_mode") or _text(bl, "passive-mode")
 
     return {
-        "enforcement_mode": em_raw or "transparent",
+        "enforcement_mode": em_raw,
         "passive_mode":     pm_raw or "disabled",
         "violations": [
             _parse_blocking_violation(v) for v in _findall(bl, "violation")

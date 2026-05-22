@@ -1,0 +1,22 @@
+{
+  "items": [
+    {
+      "id": "2001",
+      "name": "direct_waf",
+      "partition": "Common",
+      "fullPath": "/Common/direct_waf"
+    },
+    {
+      "id": "2002",
+      "name": "api_waf",
+      "partition": "Common",
+      "fullPath": "/Common/api_waf"
+    },
+    {
+      "id": "2003",
+      "name": "any_waf",
+      "partition": "Common",
+      "fullPath": "/Common/any_waf"
+    }
+  ]
+}

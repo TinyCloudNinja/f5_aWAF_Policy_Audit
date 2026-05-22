@@ -1,0 +1,830 @@
+0001: """Bot Defense profile comparison engine.
+0002: 
+0003: Compares a target Bot Defense profile (fetched from the BIG-IP REST API
+0004: at /mgmt/tm/security/bot-defense/profile) against a baseline profile dict
+0005: and produces a ComparisonResult with severity-annotated DiffItem entries
+0006: and a compliance score.
+0007: """
+0008: from __future__ import annotations
+0009: 
+0010: from typing import Any, Dict, List, Optional
+0011: 
+0012: from .policy_comparator import (
+0013:     ComparisonResult, DiffItem,
+0014:     SEVERITY_CRITICAL, SEVERITY_WARNING, SEVERITY_INFO,
+0015:     _add, _calculate_score, _build_summary,
+0016: )
+0017: from .utils import get_logger, iso_timestamp
+0018: 
+0019: _log = get_logger("bot_defense_comparator")
+0020: 
+0021: # Template security ranking: higher = more secure
+0022: _TEMPLATE_RANK: Dict[str, int] = {
+0023:     "relaxed":  0,
+0024:     "balanced": 1,
+0025:     "strict":   2,
+0026: }
+0027: 
+0028: # Override-related reference collections to compare and report.
+0029: # Tuples: (reference_key, inline_key, display_label)
+0030: _OVERRIDE_COLLECTIONS = [
+0031:     ("anomalyCategoryOverridesReference", "anomalyCategoryOverrides", "Anomaly Category Overrides"),
+0032:     ("anomalyOverridesReference", "anomalyOverrides", "Anomaly Overrides"),
+0033:     ("classOverridesReference", "classOverrides", "Class Overrides"),
+0034:     ("externalDomainsReference", "externalDomains", "External Domains"),
+0035:     ("microServicesReference", "microServices", "Micro Services"),
+0036:     ("signatureCategoryOverridesReference", "signatureCategoryOverrides", "Signature Category Overrides"),
+0037:     ("signatureOverridesReference", "signatureOverrides", "Signature Overrides"),
+0038:     ("siteDomainsReference", "siteDomains", "Site Domains"),
+0039:     ("stagedSignaturesReference", "stagedSignatures", "Staged Signatures"),
+0040:     ("whitelistReference", "whitelist", "Whitelist"),
+0041: ]
+0042: 
+0043: 
+0044: # ── Main entry point ───────────────────────────────────────────────────────────
+0045: 
+0046: def compare_bot_profiles(
+0047:     baseline: Dict,
+0048:     target: Dict,
+0049:     profile_meta: Optional[Dict] = None,
+0050:     baseline_name: str = "baseline",
+0051:     device_hostname: str = "",
+0052:     device_mgmt_ip: str = "",
+0053:     virtual_servers: Optional[List[Dict]] = None,
+0054: ) -> ComparisonResult:
+0055:     """
+0056:     Compare a target Bot Defense profile dict against a baseline dict.
+0057: 
+0058:     Both dicts should be the raw JSON from the BIG-IP REST API:
+0059:       GET /mgmt/tm/security/bot-defense/profile/{name}
+0060: 
+0061:     profile_meta may contain 'name', 'fullPath', and 'partition' keys.
+0062:     virtual_servers is the list produced by
+0063:     BotDefenseAuditor.enrich_with_virtual_servers() — the Virtual Servers
+0064:     to which this profile is applied (directly or via Local Traffic Policy).
+0065:     Returns a ComparisonResult with profile_type="bot" set.
+0066:     """
+0067:     meta = profile_meta or {}
+0068:     full_path = meta.get("fullPath") or target.get("fullPath", "unknown")
+0069:     partition = (
+0070:         full_path.strip("/").split("/")[0]
+0071:         if full_path and full_path != "unknown"
+0072:         else "Common"
+0073:     )
+0074:     name = meta.get("name") or target.get("name", "unknown")
+0075: 
+0076:     result = ComparisonResult(
+0077:         policy_name=name,
+0078:         policy_path=full_path,
+0079:         partition=partition,
+0080:         enforcement_mode=target.get("enforcementMode", "transparent"),
+0081:         baseline_name=baseline_name,
+0082:         timestamp=iso_timestamp(),
+0083:         virtual_servers=virtual_servers or [],
+0084:         device_hostname=device_hostname,
+0085:         device_mgmt_ip=device_mgmt_ip,
+0086:         profile_type="bot",
+0087:     )
+0088: 
+0089:     _cmp_bd_core(baseline, target, result)
+0090:     _cmp_bd_mobile_detection(baseline, target, result)
+0091:     _cmp_bd_signature_enforcement(baseline, target, result)
+0092:     _cmp_bd_whitelist(baseline, target, result)
+0093:     _cmp_bd_browsers(baseline, target, result)
+0094:     _cmp_bd_overrides(baseline, target, result)
+0095: 
+0096:     _build_summary(result)
+0097:     result.score = _calculate_score(result.diffs)
+0098:     return result
+0099: 
+0100: 
+0101: # ── Section comparators ────────────────────────────────────────────────────────
+0102: 
+0103: def _cmp_bd_core(baseline: Dict, target: Dict, result: ComparisonResult) -> None:
+0104:     """Compare top-level Bot Defense profile settings."""
+0105: 
+0106:     # enforcementMode: blocking vs transparent → CRITICAL if downgraded
+0107:     b_mode = baseline.get("enforcementMode", "transparent")
+0108:     t_mode = target.get("enforcementMode", "transparent")
+0109:     if b_mode != t_mode:
+0110:         sev = (
+0111:             SEVERITY_CRITICAL
+0112:             if b_mode == "blocking" and t_mode != "blocking"
+0113:             else SEVERITY_WARNING
+0114:         )
+0115:         _add(result, DiffItem(
+0116:             section="bot-defense",
+0117:             element_name="enforcementMode",
+0118:             attribute="enforcementMode",
+0119:             baseline_value=b_mode,
+0120:             target_value=t_mode,
+0121:             severity=sev,
+0122:             description=(
+0123:                 f"Bot Defense enforcement mode differs. Baseline: '{b_mode}', Target: '{t_mode}'."
+0124:                 + (" Bot threats will NOT be blocked." if sev == SEVERITY_CRITICAL else "")
+0125:             ),
+0126:         ))
+0127: 
+0128:     # template: strict/balanced/relaxed — downgrade is CRITICAL, upgrade/lateral WARNING
+0129:     b_tmpl = baseline.get("template")
+0130:     t_tmpl = target.get("template")
+0131:     if b_tmpl is not None and b_tmpl != t_tmpl:
+0132:         b_rank = _TEMPLATE_RANK.get(str(b_tmpl), 1)
+0133:         t_rank = _TEMPLATE_RANK.get(str(t_tmpl), 1)
+0134:         sev = SEVERITY_CRITICAL if t_rank < b_rank else SEVERITY_WARNING
+0135:         _add(result, DiffItem(
+0136:             section="bot-defense",
+0137:             element_name="template",
+0138:             attribute="template",
+0139:             baseline_value=b_tmpl,
+0140:             target_value=t_tmpl,
+0141:             severity=sev,
+0142:             description=(
+0143:                 f"Bot Defense template changed from '{b_tmpl}' to '{t_tmpl}'."
+0144:                 + (" Security posture has been weakened." if sev == SEVERITY_CRITICAL else "")
+0145:             ),
+0146:         ))
+0147: 
+0148:     # browserMitigationAction: block → non-block is CRITICAL
+0149:     b_bma = baseline.get("browserMitigationAction")
+0150:     t_bma = target.get("browserMitigationAction")
+0151:     if b_bma is not None and b_bma != t_bma:
+0152:         sev = (
+0153:             SEVERITY_CRITICAL
+0154:             if b_bma == "block" and t_bma != "block"
+0155:             else SEVERITY_WARNING
+0156:         )
+0157:         _add(result, DiffItem(
+0158:             section="bot-defense",
+0159:             element_name="browserMitigationAction",
+0160:             attribute="browserMitigationAction",
+0161:             baseline_value=b_bma,
+0162:             target_value=t_bma,
+0163:             severity=sev,
+0164:             description=(
+0165:                 f"Browser mitigation action changed from '{b_bma}' to '{t_bma}'."
+0166:                 + (" Suspicious browsers will NOT be blocked." if sev == SEVERITY_CRITICAL else "")
+0167:             ),
+0168:         ))
+0169: 
+0170:     # Settings where baseline=enabled and target=disabled is a security downgrade (WARNING)
+0171:     _enabled_disabled_attrs = [
+0172:         ("allowBrowserAccess",
+0173:          SEVERITY_WARNING,
+0174:          "Allow browser access setting differs from baseline."),
+0175:         ("apiAccessStrictMitigation",
+0176:          SEVERITY_WARNING,
+0177:          "API access strict mitigation differs from baseline."),
+0178:         ("dosAttackStrictMitigation",
+0179:          SEVERITY_WARNING,
+0180:          "DoS attack strict mitigation differs from baseline."),
+0181:         ("signatureStagingUponUpdate",
+0182:          SEVERITY_WARNING,
+0183:          "Signature staging upon update setting differs from baseline."),
+0184:         ("crossDomainRequests",
+0185:          SEVERITY_WARNING,
+0186:          "Cross-domain requests setting differs from baseline."),
+0187:     ]
+0188:     for attr, sev, desc in _enabled_disabled_attrs:
+0189:         b_val = baseline.get(attr)
+0190:         t_val = target.get(attr)
+0191:         if b_val is not None and b_val != t_val:
+0192:             _add(result, DiffItem(
+0193:                 section="bot-defense",
+0194:                 element_name=attr,
+0195:                 attribute=attr,
+0196:                 baseline_value=b_val,
+0197:                 target_value=t_val,
+0198:                 severity=sev,
+0199:                 description=desc,
+0200:             ))
+0201: 
+0202:     # Informational settings
+0203:     _info_attrs = [
+0204:         ("performChallengeInTransparent",
+0205:          SEVERITY_INFO,
+0206:          "Perform challenge in transparent mode differs from baseline."),
+0207:         ("singlePageApplication",
+0208:          SEVERITY_INFO,
+0209:          "Single page application setting differs from baseline."),
+0210:         ("deviceidMode",
+0211:          SEVERITY_INFO,
+0212:          "Device ID mode differs from baseline."),
+0213:         ("gracePeriod",
+0214:          SEVERITY_INFO,
+0215:          "Grace period differs from baseline."),
+0216:         ("enforcementReadinessPeriod",
+0217:          SEVERITY_INFO,
+0218:          "Enforcement readiness period differs from baseline."),
+0219:     ]
+0220:     for attr, sev, desc in _info_attrs:
+0221:         b_val = baseline.get(attr)
+0222:         t_val = target.get(attr)
+0223:         if b_val is not None and b_val != t_val:
+0224:             _add(result, DiffItem(
+0225:                 section="bot-defense",
+0226:                 element_name=attr,
+0227:                 attribute=attr,
+0228:                 baseline_value=b_val,
+0229:                 target_value=t_val,
+0230:                 severity=sev,
+0231:                 description=desc,
+0232:             ))
+0233: 
+0234:     # Store all tracked settings for the display table
+0235:     _all_tracked = (
+0236:         ["enforcementMode", "template", "browserMitigationAction"]
+0237:         + [a for a, _, _ in _enabled_disabled_attrs]
+0238:         + [a for a, _, _ in _info_attrs]
+0239:     )
+0240:     result.bot_mitigation_target   = {k: target.get(k)   for k in _all_tracked}
+0241:     result.bot_mitigation_baseline = {k: baseline.get(k) for k in _all_tracked}
+0242: 
+0243: 
+0244: def _cmp_bd_mobile_detection(
+0245:     baseline: Dict, target: Dict, result: ComparisonResult
+0246: ) -> None:
+0247:     """Compare the mobileDetection sub-object."""
+0248:     b_md = baseline.get("mobileDetection", {})
+0249:     t_md = target.get("mobileDetection", {})
+0250:     if not b_md:
+0251:         return
+0252: 
+0253:     # Each tuple: (attr, baseline_secure_val, downgrade_desc, downgrade_sev, other_sev)
+0254:     # baseline_secure_val: the value in baseline that means "secure" — if target changes
+0255:     #   away from it, that is a potential security downgrade.
+0256:     # Set baseline_secure_val=None to skip directional severity logic.
+0257:     _md_checks = [
+0258:         (
+0259:             "allowAndroidRootedDevice",
+0260:             "disabled",
+0261:             "Rooted Android devices are blocked in baseline but ALLOWED in target.",
+0262:             SEVERITY_CRITICAL,
+0263:             SEVERITY_WARNING,
+0264:         ),
+0265:         (
+0266:             "allowEmulators",
+0267:             "disabled",
+0268:             "Emulators are blocked in baseline but ALLOWED in target.",
+0269:             SEVERITY_CRITICAL,
+0270:             SEVERITY_WARNING,
+0271:         ),
+0272:         (
+0273:             "allowJailbrokenDevices",
+0274:             "disabled",
+0275:             "Jailbroken iOS devices are blocked in baseline but ALLOWED in target.",
+0276:             SEVERITY_CRITICAL,
+0277:             SEVERITY_WARNING,
+0278:         ),
+0279:         (
+0280:             "blockDebuggerEnabledDevice",
+0281:             "enabled",
+0282:             "Debugger-enabled devices are blocked in baseline but NOT blocked in target.",
+0283:             SEVERITY_CRITICAL,
+0284:             SEVERITY_WARNING,
+0285:         ),
+0286:         (
+0287:             "allowAnyAndroidPackage",
+0288:             None,
+0289:             "",
+0290:             SEVERITY_WARNING,
+0291:             SEVERITY_WARNING,
+0292:         ),
+0293:         (
+0294:             "allowAnyIosPackage",
+0295:             None,
+0296:             "",
+0297:             SEVERITY_WARNING,
+0298:             SEVERITY_WARNING,
+0299:         ),
+0300:         (
+0301:             "clientSideChallengeMode",
+0302:             None,
+0303:             "",
+0304:             SEVERITY_WARNING,
+0305:             SEVERITY_WARNING,
+0306:         ),
+0307:     ]
+0308: 
+0309:     for attr, secure_val, downgrade_desc, downgrade_sev, other_sev in _md_checks:
+0310:         b_val = b_md.get(attr)
+0311:         t_val = t_md.get(attr)
+0312:         if b_val is None or b_val == t_val:
+0313:             continue
+0314: 
+0315:         # Determine severity: if this is a known security downgrade, use downgrade_sev
+0316:         if secure_val and b_val == secure_val:
+0317:             sev = downgrade_sev
+0318:             desc = downgrade_desc
+0319:         else:
+0320:             sev = other_sev
+0321:             desc = f"Mobile detection '{attr}' differs from baseline. Baseline: '{b_val}', Target: '{t_val}'."
+0322: 
+0323:         _add(result, DiffItem(
+0324:             section="bot-defense.mobileDetection",
+0325:             element_name=attr,
+0326:             attribute=attr,
+0327:             baseline_value=b_val,
+0328:             target_value=t_val,
+0329:             severity=sev,
+0330:             description=desc,
+0331:         ))
+0332: 
+0333: 
+0334: def _get_subcollection(profile: Dict, key: str) -> List[Dict]:
+0335:     """
+0336:     Return the items list from a sub-collection field.
+0337: 
+0338:     Handles both expanded sub-collections (``{key}Reference: {items: [...]}``
+0339:     returned when the API is called with ``?expandSubcollections=true``) and
+0340:     inline lists (``{key}: [...]``).
+0341:     """
+0342:     # Expanded reference: signaturesReference.items / whitelistReference.items …
+0343:     ref = profile.get(f"{key}Reference", {})
+0344:     if isinstance(ref, dict) and "items" in ref:
+0345:         return ref["items"]
+0346:     # Inline list: signatures / whitelist / browsers
+0347:     inline = profile.get(key, [])
+0348:     if isinstance(inline, list):
+0349:         return inline
+0350:     return []
+0351: 
+0352: 
+0353: def _get_reference_subcollection(profile: Dict, ref_key: str, inline_key: str) -> List[Dict]:
+0354:     """Return items from a specific ``...Reference`` key with inline fallback."""
+0355:     ref = profile.get(ref_key, {})
+0356:     if isinstance(ref, dict) and isinstance(ref.get("items"), list):
+0357:         return ref.get("items", [])
+0358:     inline = profile.get(inline_key, [])
+0359:     if isinstance(inline, list):
+0360:         return inline
+0361:     return []
+0362: 
+0363: 
+0364: def _override_entry_key(entry: Dict) -> str:
+0365:     """Derive a stable display/comparison key for Bot Defense override entries."""
+0366:     for k in (
+0367:         "id", "name", "fullPath", "signatureId", "signatureName",
+0368:         "category", "className", "serviceName", "domain", "host",
+0369:         "ipAddress", "ip", "value",
+0370:     ):
+0371:         v = entry.get(k)
+0372:         if v not in (None, ""):
+0373:             return str(v)
+0374:     # Deterministic fallback for entries without an obvious identity field.
+0375:     try:
+0376:         import json
+0377:         return json.dumps(entry, sort_keys=True)
+0378:     except Exception:
+0379:         return str(entry)
+0380: 
+0381: 
+0382: def _cmp_bd_signature_enforcement(
+0383:     baseline: Dict, target: Dict, result: ComparisonResult
+0384: ) -> None:
+0385:     """
+0386:     Compare Bot Defense signature / signature-category enforcement settings.
+0387: 
+0388:     Each entry is keyed by ``name`` (signature category name).  The relevant
+0389:     attributes per entry are ``enabled`` and ``action`` (block/detect/alarm).
+0390:     """
+0391:     b_sigs = {
+0392:         s.get("name", ""): s
+0393:         for s in _get_subcollection(baseline, "signatures")
+0394:         if s.get("name")
+0395:     }
+0396:     t_sigs = {
+0397:         s.get("name", ""): s
+0398:         for s in _get_subcollection(target, "signatures")
+0399:         if s.get("name")
+0400:     }
+0401: 
+0402:     if not b_sigs and not t_sigs:
+0403:         return
+0404: 
+0405:     # Action severity ranking: higher = more restrictive
+0406:     _ACTION_RANK: Dict[str, int] = {
+0407:         "detect": 0,
+0408:         "alarm":  0,
+0409:         "log":    0,
+0410:         "block":  1,
+0411:     }
+0412: 
+0413:     all_names = sorted(set(b_sigs) | set(t_sigs))
+0414:     display_rows: List[Dict] = []
+0415: 
+0416:     for name in all_names:
+0417:         b_entry = b_sigs.get(name)
+0418:         t_entry = t_sigs.get(name)
+0419: 
+0420:         if b_entry is None:
+0421:             # Extra in target — informational
+0422:             display_rows.append({
+0423:                 "name": name,
+0424:                 "baseline_enabled": None,
+0425:                 "target_enabled": t_entry.get("enabled"),
+0426:                 "baseline_action": None,
+0427:                 "target_action": t_entry.get("action"),
+0428:                 "baseline_match": "extra",
+0429:             })
+0430:             _add(result, DiffItem(
+0431:                 section="bot-defense.signatures",
+0432:                 element_name=name,
+0433:                 attribute="enabled",
+0434:                 baseline_value=None,
+0435:                 target_value=t_entry.get("enabled"),
+0436:                 severity=SEVERITY_INFO,
+0437:                 description=f"Signature category '{name}' is present in target but not in baseline.",
+0438:             ))
+0439:             continue
+0440: 
+0441:         if t_entry is None:
+0442:             # Missing from target
+0443:             display_rows.append({
+0444:                 "name": name,
+0445:                 "baseline_enabled": b_entry.get("enabled"),
+0446:                 "target_enabled": None,
+0447:                 "baseline_action": b_entry.get("action"),
+0448:                 "target_action": None,
+0449:                 "baseline_match": "missing",
+0450:             })
+0451:             _add(result, DiffItem(
+0452:                 section="bot-defense.signatures",
+0453:                 element_name=name,
+0454:                 attribute="enabled",
+0455:                 baseline_value=b_entry.get("enabled"),
+0456:                 target_value=None,
+0457:                 severity=SEVERITY_WARNING,
+0458:                 description=f"Signature category '{name}' is present in baseline but missing from target.",
+0459:             ))
+0460:             continue
+0461: 
+0462:         # Both present — compare enabled and action
+0463:         b_enabled = b_entry.get("enabled")
+0464:         t_enabled = t_entry.get("enabled")
+0465:         b_action  = b_entry.get("action")
+0466:         t_action  = t_entry.get("action")
+0467: 
+0468:         match = True
+0469:         if b_enabled != t_enabled:
+0470:             match = False
+0471:             sev = (
+0472:                 SEVERITY_CRITICAL
+0473:                 if b_enabled is True and t_enabled is False
+0474:                 else SEVERITY_WARNING
+0475:             )
+0476:             _add(result, DiffItem(
+0477:                 section="bot-defense.signatures",
+0478:                 element_name=name,
+0479:                 attribute="enabled",
+0480:                 baseline_value=b_enabled,
+0481:                 target_value=t_enabled,
+0482:                 severity=sev,
+0483:                 description=(
+0484:                     f"Signature category '{name}' enabled state differs. "
+0485:                     f"Baseline: {b_enabled}, Target: {t_enabled}."
+0486:                     + (" Category will NOT be enforced." if sev == SEVERITY_CRITICAL else "")
+0487:                 ),
+0488:             ))
+0489: 
+0490:         if b_action is not None and b_action != t_action:
+0491:             match = False
+0492:             b_rank = _ACTION_RANK.get(str(b_action).lower(), 0)
+0493:             t_rank = _ACTION_RANK.get(str(t_action).lower(), 0)
+0494:             sev = SEVERITY_CRITICAL if t_rank < b_rank else SEVERITY_WARNING
+0495:             _add(result, DiffItem(
+0496:                 section="bot-defense.signatures",
+0497:                 element_name=name,
+0498:                 attribute="action",
+0499:                 baseline_value=b_action,
+0500:                 target_value=t_action,
+0501:                 severity=sev,
+0502:                 description=(
+0503:                     f"Signature category '{name}' action changed from '{b_action}' to '{t_action}'."
+0504:                     + (" Enforcement has been weakened." if sev == SEVERITY_CRITICAL else "")
+0505:                 ),
+0506:             ))
+0507: 
+0508:         display_rows.append({
+0509:             "name": name,
+0510:             "baseline_enabled": b_enabled,
+0511:             "target_enabled": t_enabled,
+0512:             "baseline_action": b_action,
+0513:             "target_action": t_action,
+0514:             "baseline_match": "match" if match else "diff",
+0515:         })
+0516: 
+0517:     result.bot_signatures = display_rows
+0518: 
+0519: 
+0520: def _cmp_bd_whitelist(
+0521:     baseline: Dict, target: Dict, result: ComparisonResult
+0522: ) -> None:
+0523:     """
+0524:     Compare Bot Defense whitelist (allowed/trusted source) entries.
+0525: 
+0526:     Entries are keyed by name.  Differences in ``ipAddress``, ``ipMask``,
+0527:     ``matchType``, ``enabled``, and ``description`` are flagged.
+0528:     """
+0529:     def _entry_key(e: Dict) -> str:
+0530:         return e.get("name") or e.get("ipAddress", "")
+0531: 
+0532:     b_wl = {_entry_key(e): e for e in _get_subcollection(baseline, "whitelist") if _entry_key(e)}
+0533:     t_wl = {_entry_key(e): e for e in _get_subcollection(target, "whitelist") if _entry_key(e)}
+0534: 
+0535:     if not b_wl and not t_wl:
+0536:         return
+0537: 
+0538:     all_keys = sorted(set(b_wl) | set(t_wl))
+0539:     display_rows: List[Dict] = []
+0540: 
+0541:     _CMP_ATTRS = ["ipAddress", "ipMask", "matchType", "enabled", "description"]
+0542: 
+0543:     for key in all_keys:
+0544:         b_entry = b_wl.get(key)
+0545:         t_entry = t_wl.get(key)
+0546: 
+0547:         if b_entry is None:
+0548:             # New whitelist entry in target — potential security relaxation
+0549:             display_rows.append({
+0550:                 "name": key,
+0551:                 "baseline_entry": None,
+0552:                 "target_entry": t_entry,
+0553:                 "baseline_match": "extra",
+0554:             })
+0555:             _add(result, DiffItem(
+0556:                 section="bot-defense.whitelist",
+0557:                 element_name=key,
+0558:                 attribute="present",
+0559:                 baseline_value=False,
+0560:                 target_value=True,
+0561:                 severity=SEVERITY_WARNING,
+0562:                 description=(
+0563:                     f"Whitelist entry '{key}' is in target but not in baseline. "
+0564:                     "A new trusted source exception has been added."
+0565:                 ),
+0566:             ))
+0567:             continue
+0568: 
+0569:         if t_entry is None:
+0570:             # Entry removed from target
+0571:             display_rows.append({
+0572:                 "name": key,
+0573:                 "baseline_entry": b_entry,
+0574:                 "target_entry": None,
+0575:                 "baseline_match": "missing",
+0576:             })
+0577:             _add(result, DiffItem(
+0578:                 section="bot-defense.whitelist",
+0579:                 element_name=key,
+0580:                 attribute="present",
+0581:                 baseline_value=True,
+0582:                 target_value=False,
+0583:                 severity=SEVERITY_INFO,
+0584:                 description=f"Whitelist entry '{key}' is in baseline but missing from target.",
+0585:             ))
+0586:             continue
+0587: 
+0588:         # Both present — compare attributes
+0589:         differs = False
+0590:         for attr in _CMP_ATTRS:
+0591:             b_val = b_entry.get(attr)
+0592:             t_val = t_entry.get(attr)
+0593:             if b_val is not None and b_val != t_val:
+0594:                 differs = True
+0595:                 sev = (
+0596:                     SEVERITY_CRITICAL
+0597:                     if attr == "enabled" and b_val is True and t_val is False
+0598:                     else SEVERITY_WARNING
+0599:                 )
+0600:                 _add(result, DiffItem(
+0601:                     section="bot-defense.whitelist",
+0602:                     element_name=key,
+0603:                     attribute=attr,
+0604:                     baseline_value=b_val,
+0605:                     target_value=t_val,
+0606:                     severity=sev,
+0607:                     description=f"Whitelist entry '{key}' attribute '{attr}' differs from baseline.",
+0608:                 ))
+0609: 
+0610:         display_rows.append({
+0611:             "name": key,
+0612:             "baseline_entry": b_entry,
+0613:             "target_entry": t_entry,
+0614:             "baseline_match": "diff" if differs else "match",
+0615:         })
+0616: 
+0617:     result.bot_whitelist = display_rows
+0618: 
+0619: 
+0620: def _cmp_bd_browsers(
+0621:     baseline: Dict, target: Dict, result: ComparisonResult
+0622: ) -> None:
+0623:     """
+0624:     Compare Bot Defense browser validation settings.
+0625: 
+0626:     Entries are keyed by ``name``.  The primary attribute is ``enabled``;
+0627:     any additional per-browser attributes present in the baseline are also
+0628:     compared.
+0629:     """
+0630:     b_br = {
+0631:         e.get("name", ""): e
+0632:         for e in _get_subcollection(baseline, "browsers")
+0633:         if e.get("name")
+0634:     }
+0635:     t_br = {
+0636:         e.get("name", ""): e
+0637:         for e in _get_subcollection(target, "browsers")
+0638:         if e.get("name")
+0639:     }
+0640: 
+0641:     if not b_br and not t_br:
+0642:         return
+0643: 
+0644:     all_names = sorted(set(b_br) | set(t_br))
+0645:     display_rows: List[Dict] = []
+0646: 
+0647:     for name in all_names:
+0648:         b_entry = b_br.get(name)
+0649:         t_entry = t_br.get(name)
+0650: 
+0651:         if b_entry is None:
+0652:             display_rows.append({
+0653:                 "name": name,
+0654:                 "baseline_entry": None,
+0655:                 "target_entry": t_entry,
+0656:                 "baseline_match": "extra",
+0657:             })
+0658:             _add(result, DiffItem(
+0659:                 section="bot-defense.browsers",
+0660:                 element_name=name,
+0661:                 attribute="present",
+0662:                 baseline_value=False,
+0663:                 target_value=True,
+0664:                 severity=SEVERITY_INFO,
+0665:                 description=f"Browser entry '{name}' is present in target but not in baseline.",
+0666:             ))
+0667:             continue
+0668: 
+0669:         if t_entry is None:
+0670:             display_rows.append({
+0671:                 "name": name,
+0672:                 "baseline_entry": b_entry,
+0673:                 "target_entry": None,
+0674:                 "baseline_match": "missing",
+0675:             })
+0676:             _add(result, DiffItem(
+0677:                 section="bot-defense.browsers",
+0678:                 element_name=name,
+0679:                 attribute="present",
+0680:                 baseline_value=True,
+0681:                 target_value=False,
+0682:                 severity=SEVERITY_WARNING,
+0683:                 description=f"Browser entry '{name}' is in baseline but missing from target.",
+0684:             ))
+0685:             continue
+0686: 
+0687:         # Compare all attributes present in baseline entry
+0688:         differs = False
+0689:         for attr, b_val in b_entry.items():
+0690:             if attr in ("name", "kind", "selfLink", "generation", "lastUpdateMicros"):
+0691:                 continue
+0692:             t_val = t_entry.get(attr)
+0693:             if b_val != t_val:
+0694:                 differs = True
+0695:                 sev = (
+0696:                     SEVERITY_CRITICAL
+0697:                     if attr == "enabled" and b_val is True and t_val is False
+0698:                     else SEVERITY_WARNING
+0699:                 )
+0700:                 _add(result, DiffItem(
+0701:                     section="bot-defense.browsers",
+0702:                     element_name=name,
+0703:                     attribute=attr,
+0704:                     baseline_value=b_val,
+0705:                     target_value=t_val,
+0706:                     severity=sev,
+0707:                     description=(
+0708:                         f"Browser '{name}' attribute '{attr}' differs from baseline."
+0709:                         + (" Browser validation disabled." if sev == SEVERITY_CRITICAL else "")
+0710:                     ),
+0711:                 ))
+0712: 
+0713:         display_rows.append({
+0714:             "name": name,
+0715:             "baseline_entry": b_entry,
+0716:             "target_entry": t_entry,
+0717:             "baseline_match": "diff" if differs else "match",
+0718:         })
+0719: 
+0720:     result.bot_browsers = display_rows
+0721: 
+0722: 
+0723: def _cmp_bd_overrides(
+0724:     baseline: Dict, target: Dict, result: ComparisonResult
+0725: ) -> None:
+0726:     """
+0727:     Compare override-oriented Bot Defense collections.
+0728: 
+0729:     The baseline profile is expected to contain no override entries. Any
+0730:     override entries found in target are recorded in ``result.bot_overrides``
+0731:     and flagged as WARNING differences.
+0732:     """
+0733:     display_rows: List[Dict] = []
+0734: 
+0735:     for ref_key, inline_key, label in _OVERRIDE_COLLECTIONS:
+0736:         b_items = _get_reference_subcollection(baseline, ref_key, inline_key)
+0737:         t_items = _get_reference_subcollection(target, ref_key, inline_key)
+0738: 
+0739:         b_map = {
+0740:             _override_entry_key(e): e
+0741:             for e in b_items if isinstance(e, dict)
+0742:         }
+0743:         t_map = {
+0744:             _override_entry_key(e): e
+0745:             for e in t_items if isinstance(e, dict)
+0746:         }
+0747: 
+0748:         all_keys = sorted(set(b_map) | set(t_map))
+0749:         for key in all_keys:
+0750:             b_entry = b_map.get(key)
+0751:             t_entry = t_map.get(key)
+0752: 
+0753:             if b_entry is None:
+0754:                 display_rows.append({
+0755:                     "collection": label,
+0756:                     "name": key,
+0757:                     "baseline_entry": None,
+0758:                     "target_entry": t_entry,
+0759:                     "baseline_match": "extra",
+0760:                 })
+0761:                 _add(result, DiffItem(
+0762:                     section=f"bot-defense.overrides.{inline_key}",
+0763:                     element_name=key,
+0764:                     attribute="present",
+0765:                     baseline_value=False,
+0766:                     target_value=True,
+0767:                     severity=SEVERITY_WARNING,
+0768:                     description=(
+0769:                         f"Override entry '{key}' was added in '{label}' on target profile."
+0770:                     ),
+0771:                 ))
+0772:                 result.extra_in_target.append(
+0773:                     {"section": f"bot-defense.overrides.{inline_key}", "name": key}
+0774:                 )
+0775:                 continue
+0776: 
+0777:             if t_entry is None:
+0778:                 display_rows.append({
+0779:                     "collection": label,
+0780:                     "name": key,
+0781:                     "baseline_entry": b_entry,
+0782:                     "target_entry": None,
+0783:                     "baseline_match": "missing",
+0784:                 })
+0785:                 _add(result, DiffItem(
+0786:                     section=f"bot-defense.overrides.{inline_key}",
+0787:                     element_name=key,
+0788:                     attribute="present",
+0789:                     baseline_value=True,
+0790:                     target_value=False,
+0791:                     severity=SEVERITY_INFO,
+0792:                     description=(
+0793:                         f"Override entry '{key}' from baseline '{label}' is missing on target."
+0794:                     ),
+0795:                 ))
+0796:                 result.missing_in_target.append(
+0797:                     {"section": f"bot-defense.overrides.{inline_key}", "name": key}
+0798:                 )
+0799:                 continue
+0800: 
+0801:             # Both present — detect content drift.
+0802:             if b_entry != t_entry:
+0803:                 display_rows.append({
+0804:                     "collection": label,
+0805:                     "name": key,
+0806:                     "baseline_entry": b_entry,
+0807:                     "target_entry": t_entry,
+0808:                     "baseline_match": "diff",
+0809:                 })
+0810:                 _add(result, DiffItem(
+0811:                     section=f"bot-defense.overrides.{inline_key}",
+0812:                     element_name=key,
+0813:                     attribute="content",
+0814:                     baseline_value=b_entry,
+0815:                     target_value=t_entry,
+0816:                     severity=SEVERITY_WARNING,
+0817:                     description=(
+0818:                         f"Override entry '{key}' in '{label}' differs from baseline."
+0819:                     ),
+0820:                 ))
+0821:             else:
+0822:                 display_rows.append({
+0823:                     "collection": label,
+0824:                     "name": key,
+0825:                     "baseline_entry": b_entry,
+0826:                     "target_entry": t_entry,
+0827:                     "baseline_match": "match",
+0828:                 })
+0829: 
+0830:     result.bot_overrides = display_rows

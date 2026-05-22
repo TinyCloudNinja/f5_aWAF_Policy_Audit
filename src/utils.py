@@ -1,13 +1,18 @@
 """
-Utility functions: logging setup, helpers, retry logic.
+Utility functions: logging setup, helpers, retry logic, and compliance tier helpers.
+
+Changelog: Scoring refactor – added tier calculation utilities and color constants
+for the graduated 4-tier compliance model used by WAF and Bot Defense comparators.
 """
 import logging
 import os
 import re
 import time
 import functools
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -173,3 +178,107 @@ def human_bool(value) -> str:
     if isinstance(value, bool):
         return "Enabled" if value else "Disabled"
     return str(value)
+
+
+# ── Compliance tier helpers (scoring presentation layer utility) ───────────────
+
+# Default tier band definitions for 4-level model
+TIER_RED = "RED"
+TIER_AMBER = "AMBER"
+TIER_YELLOW = "YELLOW"
+TIER_GREEN = "GREEN"
+
+_TIER_BANDS = [
+    {
+        "name": TIER_RED,
+        "label": "Non-Compliant",
+        "emoji": "🔴",
+        "color": "#dc3545",
+        "min": 0,
+        "max": 49,
+    },
+    {
+        "name": TIER_AMBER,
+        "label": "Review Required",
+        "emoji": "🟠",
+        "color": "#fd7e14",
+        "min": 50,
+        "max": 74,
+    },
+    {
+        "name": TIER_YELLOW,
+        "label": "Monitor",
+        "emoji": "🟡",
+        "color": "#ffc107",
+        "min": 75,
+        "max": 89,
+    },
+    {
+        "name": TIER_GREEN,
+        "label": "Compliant",
+        "emoji": "🟢",
+        "color": "#28a745",
+        "min": 90,
+        "max": 100,
+    },
+]
+
+
+@dataclass(frozen=True)
+class TierInfo:
+    """Represents a compliance tier derived from a score.
+
+    The tier calculation is pure and side-effect free, making it easy to unit test.
+    The green threshold can be overridden for backward compatibility with the
+    legacy --pass-threshold CLI flag.
+    """
+
+    name: str
+    label: str
+    color: str
+    emoji: str
+    score: float
+    is_hard_fail: bool
+    circuit_breakers: list[str]
+
+
+def score_to_tier(score: float, circuit_breakers: Optional[List[str]] = None, green_threshold: float = 90.0) -> TierInfo:
+    """Map a numeric score to a tier.
+
+    Args:
+        score: Final compliance score (0–100 after any circuit breaker capping).
+        circuit_breakers: List of triggered circuit breaker names (empty if none).
+        green_threshold: Lower bound for the Green tier (default 90.0) to support
+            backward compatibility with the legacy --pass-threshold flag. Only the
+            Green/YELLOW boundary shifts; Amber/Red remain at 74/49 respectively.
+
+    Returns:
+        TierInfo with name/label/color/emoji and whether any circuit breaker fired.
+    """
+
+    cb_list = circuit_breakers or []
+    # Adjust the yellow/green boundary if the caller overrides the green threshold.
+    bands = list(_TIER_BANDS)
+    if green_threshold != 90.0:
+        # Clamp to sane range
+        g_min = max(0, min(100, green_threshold))
+        for band in bands:
+            if band["name"] == TIER_GREEN:
+                band["min"] = g_min
+            if band["name"] == TIER_YELLOW:
+                band["max"] = max(74, g_min - 1)
+    # Select band
+    chosen = bands[0]
+    for band in bands:
+        if band["min"] <= score <= band["max"]:
+            chosen = band
+            break
+    return TierInfo(
+        name=chosen["name"],
+        label=chosen["label"],
+        color=chosen["color"],
+        emoji=chosen["emoji"],
+        score=score,
+        is_hard_fail=bool(cb_list),
+        circuit_breakers=cb_list,
+    )

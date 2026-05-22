@@ -1,0 +1,72 @@
+{
+  "items": [
+    {
+      "name": "ltm_host_policy",
+      "partition": "Common",
+      "fullPath": "/Common/ltm_host_policy",
+      "rulesReference": {
+        "items": [
+          {
+            "name": "route_api",
+            "conditionsReference": {
+              "items": [
+                {
+                  "type": "httpHeader",
+                  "name": "host",
+                  "values": [
+                    "api.example.gov"
+                  ]
+                }
+              ]
+            },
+            "actionsReference": {
+              "items": [
+                {
+                  "type": "asm",
+                  "enable": true,
+                  "policy": {
+                    "id": "2002"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ltm_any_policy",
+      "partition": "Common",
+      "fullPath": "/Common/ltm_any_policy",
+      "rulesReference": {
+        "items": [
+          {
+            "name": "uri_route",
+            "conditionsReference": {
+              "items": [
+                {
+                  "type": "httpUri",
+                  "path": true,
+                  "values": [
+                    "/v1/*"
+                  ]
+                }
+              ]
+            },
+            "actionsReference": {
+              "items": [
+                {
+                  "type": "asm",
+                  "enable": true,
+                  "policy": {
+                    "id": "2003"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

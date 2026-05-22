@@ -1,21 +1,10 @@
 """
 CLI entry point for the F5 BIG-IP ASM/AWAF Security Policy Auditor.
 
-Usage:
-
-
-
-Monthly CSM Sync
-    # Audit WAF (ASM/AWAF) policies (default):
-    python -m src.main --WAF --host 192.168.1.245 --username admin --baseline ./baseline/corp.xml
-
-    # Audit Bot Defense profiles:
-    python -m src.main --BOT --host 192.168.1.245 --username admin --baseli
-    
-    
-    
-    Monthly CSM Syncne ./baseline/bot.json
+Changelog: Updated CLI for tiered compliance model with fail-on-tier exit codes,
+backward-compatible --pass-threshold (Green boundary), and tier-aware summary output.
 """
+
 import argparse
 import getpass
 import json
@@ -27,25 +16,53 @@ from typing import Dict, List, Optional
 
 import yaml
 
-from .utils import setup_logging, get_logger, ensure_dir, iso_timestamp
+from .utils import (
+    setup_logging,
+    get_logger,
+    ensure_dir,
+    iso_timestamp,
+    TIER_RED,
+    TIER_AMBER,
+    TIER_YELLOW,
+    TIER_GREEN,
+)
 from .bigip_client import BigIPClient, AuthenticationError
 from .policy_exporter import PolicyExporter, ExportError
 from .policy_parser import parse_policy, get_policy_metadata
 from .policy_comparator import compare_policies
 from .bot_defense_auditor import BotDefenseAuditor
 from .bot_defense_comparator import compare_bot_profiles
-from .report_generator import generate_html, generate_markdown, generate_summary_reports
-
-from .report_generator import generate_html_dashboard, generate_markdown, generate_summary_reports
+from .report_generator import (
+    generate_html_dashboard,
+    generate_markdown,
+    generate_summary_reports,
+    generate_virtual_server_summary_markdown,
+)
 from .gitlab_state import GitLabStateManager
+from .virtual_server_inventory import collect_virtual_server_inventory
 
 import urllib3
 
 
-_PASS_THRESHOLD = 90.0
+_DEFAULT_PASS_THRESHOLD = 90.0  # Green lower bound for backward compatibility
+_DEFAULT_FAIL_ON_TIER = TIER_RED
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_OUTPUT_DIR = str((_REPO_ROOT.parent / f"{_REPO_ROOT.name}_output").resolve())
 _DEFAULT_GITLAB_LOCAL_DIR = str((_REPO_ROOT.parent / f"{_REPO_ROOT.name}_policy_state_repo").resolve())
+
+_TIER_RANK = {
+    TIER_RED: 0,
+    TIER_AMBER: 1,
+    TIER_YELLOW: 2,
+    TIER_GREEN: 3,
+}
+
+_TIER_EMOJI = {
+    TIER_RED: "🔴",
+    TIER_AMBER: "🟠",
+    TIER_YELLOW: "🟡",
+    TIER_GREEN: "🟢",
+}
 
 
 # ── Config loading ─────────────────────────────────────────────────────────────
@@ -96,6 +113,29 @@ def _build_parser() -> argparse.ArgumentParser:
     mode_group.add_argument(
         "--BOT", dest="audit_mode", action="store_const", const="bot",
         help="Audit Bot Defense profiles against a JSON baseline",
+    )
+
+    # Tiered scoring controls
+    p.add_argument(
+        "--pass-threshold",
+        dest="pass_threshold",
+        type=float,
+        default=None,
+        metavar="N",
+        help=(
+            "Backward-compatible Green lower bound (default: 90). "
+            "Only shifts the Yellow/Green boundary; other bands remain fixed."
+        ),
+    )
+    p.add_argument(
+        "--fail-on-tier",
+        dest="fail_on_tier",
+        choices=["RED", "AMBER", "YELLOW", "GREEN", "red", "amber", "yellow", "green"],
+        default=None,
+        help=(
+            "Tier that triggers a non-zero exit code. "
+            "RED (default) fails on any Red policy; AMBER fails on Amber or worse, etc."
+        ),
     )
 
     p.add_argument("--config", metavar="FILE",
@@ -254,7 +294,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Use the BIGIP_PASS environment variable or the interactive prompt.",
             file=sys.stderr,
         )
-        return 1
+        return 2
     password = os.environ.get("BIGIP_PASS")
     login_provider = _resolve(
         args.login_provider, "BIGIP_LOGIN_PROVIDER",
@@ -284,6 +324,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         partitions = audit_cfg.get("partitions") or []
 
     verbose = args.verbose
+
+    # Tier thresholds
+    pass_threshold = _resolve(
+        args.pass_threshold, "PASS_THRESHOLD", audit_cfg.get("pass_threshold"), _DEFAULT_PASS_THRESHOLD
+    )
+    fail_on_tier = _resolve(
+        args.fail_on_tier, "FAIL_ON_TIER", audit_cfg.get("fail_on_tier"), _DEFAULT_FAIL_ON_TIER
+    )
+    try:
+        pass_threshold = float(pass_threshold)
+    except (TypeError, ValueError):
+        print("ERROR: --pass-threshold must be a number.")
+        return 2
+    fail_on_tier = str(fail_on_tier).upper()
+    if fail_on_tier not in _TIER_RANK:
+        print("ERROR: --fail-on-tier must be one of RED, AMBER, YELLOW, GREEN.")
+        return 2
 
     # GitLab-backed policy state settings
     gitlab_repo_url = _resolve(
@@ -340,7 +397,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if missing:
         parser.print_usage()
         print(f"\nERROR: Missing required arguments: {', '.join(missing)}")
-        return 1
+        return 2
 
     logger.info("Audit mode: %s", audit_mode.upper())
 
@@ -369,10 +426,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         concurrent = int(concurrent)
     except (TypeError, ValueError):
         print("ERROR: --concurrent-exports must be an integer between 1 and 20.")
-        return 1
+        return 2
     if not 1 <= concurrent <= 20:
         print(f"ERROR: --concurrent-exports must be between 1 and 20 (got {concurrent}).")
-        return 1
+        return 2
 
     # Password prompt if needed
     if not password:
@@ -381,13 +438,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             password = getpass.getpass(f"Password for user '{username}': ")
         except (KeyboardInterrupt, EOFError):
             print("\nAborted.")
-            return 1
+            return 2
 
     # Validate baseline
     baseline = str(Path(baseline).resolve())
     if not Path(baseline).exists():
         logger.error("Baseline file not found: %s", baseline)
-        return 1
+        return 2
 
     if audit_mode == "bot":
         logger.info("Validating baseline JSON …")
@@ -429,10 +486,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         client.authenticate()
     except AuthenticationError as exc:
         logger.error("Authentication failed: %s", exc)
-        return 1
+        return 2
     except Exception as exc:
         logger.error("Cannot connect to BIG-IP: %s", exc)
-        return 1
+        return 2
     logger.info("Authenticated successfully.")
 
     # ── Fetch device identity ─────────────────────────────────────────────────
@@ -457,7 +514,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception as exc:
         logger.error("Partition discovery failed: %s", exc)
         client.close()
-        return 1
+        return 2
 
     # ── Branch: WAF audit vs Bot Defense audit ────────────────────────────────
     if audit_mode == "bot":
@@ -474,6 +531,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             gitlab_state=gitlab_state,
             gitlab_update_source_truth=gitlab_update_source_truth,
             logger=logger,
+            fail_on_tier=fail_on_tier,
+            pass_threshold=pass_threshold,
         )
     else:
         return _run_waf_audit(
@@ -488,6 +547,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             gitlab_state=gitlab_state,
             gitlab_update_source_truth=gitlab_update_source_truth,
             logger=logger,
+            fail_on_tier=fail_on_tier,
+            pass_threshold=pass_threshold,
         )
 
 
@@ -496,14 +557,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 def _run_waf_audit(
     client, exporter, all_partitions, baseline, output_dir, formats,
     device_hostname, device_mgmt_ip, gitlab_state, gitlab_update_source_truth, logger,
+    fail_on_tier: str,
+    pass_threshold: float,
 ) -> int:
     """Run the existing ASM/AWAF policy audit."""
+    virtual_server_inventory = []
+    virtual_server_inventory_error: Optional[str] = None
+
     try:
         policies = exporter.discover_policies(all_partitions)
     except ExportError as exc:
         logger.error("Policy discovery failed: %s", exc)
         client.close()
-        return 1
+        return 2
 
     if not policies:
         logger.warning("No ASM/AWAF policies found. Exiting.")
@@ -514,6 +580,22 @@ def _run_waf_audit(
 
     # Enrich with virtual server bindings
     exporter.enrich_with_virtual_servers(policies)
+
+    try:
+        logger.info(
+            "Collecting virtual server inventory across %d partition(s)...",
+            len(all_partitions),
+        )
+        virtual_server_inventory = collect_virtual_server_inventory(
+            bigip_client=client,
+            partitions=all_partitions,
+        )
+    except Exception as exc:
+        virtual_server_inventory_error = str(exc)
+        logger.error(
+            "Virtual server inventory collection failed; continuing with policy audit: %s",
+            exc,
+        )
 
     # Export policies
     successes, failures = exporter.export_all(policies)
@@ -527,7 +609,7 @@ def _run_waf_audit(
     if not successes:
         logger.error("All exports failed. No policies to audit.")
         client.close()
-        return 1
+        return 2
 
     # Parse baseline
     logger.info("Parsing baseline policy: %s", baseline)
@@ -535,7 +617,7 @@ def _run_waf_audit(
         baseline_data = parse_policy(baseline)
     except Exception as exc:
         logger.error("Failed to parse baseline policy: %s", exc)
-        return 1
+        return 2
     baseline_name = Path(baseline).name
 
     # Compare and report
@@ -577,6 +659,7 @@ def _run_waf_audit(
                 logger=logger,
                 limit=10,
             ),
+                green_threshold=pass_threshold,
         )
         all_results.append(cmp_result)
 
@@ -598,6 +681,7 @@ def _run_waf_audit(
                             logger=logger,
                             limit=10,
                         ),
+                        green_threshold=pass_threshold,
                     )
                     sot_results.append(sot_cmp_result)
                 except Exception as exc:
@@ -613,11 +697,22 @@ def _run_waf_audit(
 
     if all_results:
         if "html" in formats:
-            generate_html_dashboard(all_results, output_dir)
+            generate_html_dashboard(
+                all_results,
+                output_dir,
+                virtual_server_inventory=virtual_server_inventory,
+                virtual_server_inventory_error=virtual_server_inventory_error,
+            )
 
         summary_formats = [f for f in formats if f != "html"]
         if summary_formats:
             generate_summary_reports(all_results, output_dir, summary_formats)
+        if "markdown" in formats:
+            generate_virtual_server_summary_markdown(
+                virtual_server_inventory=virtual_server_inventory,
+                output_dir=output_dir,
+                inventory_error=virtual_server_inventory_error,
+            )
 
     if sot_results:
         sot_output_dir = str(Path(output_dir) / "source_of_truth")
@@ -625,10 +720,21 @@ def _run_waf_audit(
             if "markdown" in formats:
                 generate_markdown(r, sot_output_dir)
         if "html" in formats:
-            generate_html_dashboard(sot_results, sot_output_dir)
+            generate_html_dashboard(
+                sot_results,
+                sot_output_dir,
+                virtual_server_inventory=virtual_server_inventory,
+                virtual_server_inventory_error=virtual_server_inventory_error,
+            )
         summary_formats = [f for f in formats if f != "html"]
         if summary_formats:
             generate_summary_reports(sot_results, sot_output_dir, summary_formats)
+        if "markdown" in formats:
+            generate_virtual_server_summary_markdown(
+                virtual_server_inventory=virtual_server_inventory,
+                output_dir=sot_output_dir,
+                inventory_error=virtual_server_inventory_error,
+            )
         logger.info(
             "Generated %d source-of-truth comparison report(s) under %s",
             len(sot_results),
@@ -663,6 +769,8 @@ def _run_waf_audit(
         output_dir=output_dir,
         subject_label="Policy",
         failure_label="policy export(s)",
+        pass_threshold=pass_threshold,
+        fail_on_tier=fail_on_tier,
     )
 
 
@@ -672,6 +780,8 @@ def _run_bot_audit(
     client, all_partitions, baseline_data, baseline_name, output_dir, formats,
     partitions, device_hostname, device_mgmt_ip, gitlab_state,
     gitlab_update_source_truth, logger,
+    fail_on_tier: str,
+    pass_threshold: float,
 ) -> int:
     """Run the Bot Defense profile audit."""
     auditor = BotDefenseAuditor(
@@ -685,7 +795,7 @@ def _run_bot_audit(
     except RuntimeError as exc:
         logger.error("Bot Defense profile discovery failed: %s", exc)
         client.close()
-        return 1
+        return 2
 
     if not profiles:
         logger.warning("No Bot Defense profiles found. Exiting.")
@@ -708,7 +818,7 @@ def _run_bot_audit(
     if not successes:
         logger.error("All profile fetches failed. No profiles to audit.")
         client.close()
-        return 1
+        return 2
 
     client.close()
 
@@ -732,6 +842,7 @@ def _run_bot_audit(
                 device_hostname=device_hostname,
                 device_mgmt_ip=device_mgmt_ip,
                 virtual_servers=profile_meta.get("virtual_servers", []),
+                green_threshold=pass_threshold,
             )
         except Exception as exc:
             logger.error(
@@ -754,6 +865,7 @@ def _run_bot_audit(
                         device_hostname=device_hostname,
                         device_mgmt_ip=device_mgmt_ip,
                         virtual_servers=profile_meta.get("virtual_servers", []),
+                        green_threshold=pass_threshold,
                     )
                     sot_results.append(sot_cmp_result)
                 except Exception as exc:
@@ -818,6 +930,8 @@ def _run_bot_audit(
         output_dir=output_dir,
         subject_label="Profile",
         failure_label="profile fetch(es)",
+        pass_threshold=pass_threshold,
+        fail_on_tier=fail_on_tier,
     )
 
 
@@ -826,8 +940,16 @@ def _run_bot_audit(
 def _print_summary(
     all_results, failures, device_hostname, device_mgmt_ip, output_dir,
     subject_label="Policy", failure_label="policy export(s)",
+    pass_threshold=_DEFAULT_PASS_THRESHOLD,
+    fail_on_tier=_DEFAULT_FAIL_ON_TIER,
 ) -> int:
-    """Print the final stdout summary table and return the exit code."""
+    """Print the final stdout summary table and return the exit code.
+
+    Exit codes:
+      0 = All subjects scored at or above the --fail-on-tier threshold.
+      1 = One or more subjects at/below the fail-on-tier threshold (non-compliant).
+      2 = Runtime/setup error (handled earlier).
+    """
     audit_label = (
         "BOT DEFENSE PROFILE AUDIT SUMMARY"
         if any(getattr(r, "profile_type", "waf") == "bot" for r in all_results)
@@ -842,23 +964,30 @@ def _print_summary(
         print(f"Device : {device_mgmt_ip}")
     print("-" * 72)
     header = (
-        f"{subject_label:<40} {'Score':>7}  {'Status':<6}  {'Critical':>8}  {'Warn':>5}"
+        f"{subject_label:<40} {'Score':>7}  {'Tier':<15}  {'Critical':>8}  {'High':>5}  {'Warn':>5}  {'Info':>5}"
     )
     print(header)
     print("-" * 72)
 
+    threshold_rank = _TIER_RANK[fail_on_tier]
     any_fail = False
     for r in sorted(all_results, key=lambda x: x.score):
-        status = "PASS" if r.score >= _PASS_THRESHOLD else "FAIL"
-        if status == "FAIL":
+        tier_rank = _TIER_RANK.get(r.tier, _TIER_RANK[TIER_RED])
+        if tier_rank <= threshold_rank:
             any_fail = True
         totals = r.summary.get("totals", {})
         crit = totals.get("critical", 0)
+        high = totals.get("high", 0)
         warn = totals.get("warning", 0)
+        info = totals.get("info", 0)
         name = r.policy_path
         if len(name) > 38:
             name = "…" + name[-37:]
-        print(f"{name:<40} {r.score:>6.1f}%  {status:<6}  {crit:>8}  {warn:>5}")
+        print(
+            f"{name:<40} {r.score:>6.1f}%  "
+            f"{_TIER_EMOJI.get(r.tier,'')} {r.tier_label:<13}  "
+            f"{crit:>8}  {high:>5}  {warn:>5}  {info:>5}"
+        )
 
     print("=" * 72)
 
@@ -871,9 +1000,15 @@ def _print_summary(
 
     exit_code = 1 if any_fail else 0
     if any_fail:
-        print(f"\nRESULT: FAIL — one or more {failure_label.split('(')[0].strip()}s scored below {_PASS_THRESHOLD:.0f}%")
+        print(
+            f"\nRESULT: NON-COMPLIANT — one or more {failure_label.split('(')[0].strip()}s are "
+            f"{fail_on_tier.title()} tier or worse."
+        )
     else:
-        print(f"\nRESULT: PASS — all {failure_label.split('(')[0].strip()}s scored >= {_PASS_THRESHOLD:.0f}%")
+        print(
+            f"\nRESULT: COMPLIANT — all {failure_label.split('(')[0].strip()}s are above "
+            f"the {fail_on_tier.title()} threshold."
+        )
 
     return exit_code
 

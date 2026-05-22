@@ -59,6 +59,10 @@ neither `--WAF` nor `--BOT` is specified.
 - Discovers all policies across partitions via the iControl REST API
 - Exports each policy as XML using the BIG-IP export task workflow
 - Parses and compares the exported XML against a baseline XML policy
+- Collects a read-only Virtual Server inventory (per partition scope) and maps
+  HTTP Host/FQDN routing to attached ASM/AWAF policies when LTM Policies invoke ASM
+- Renders a three-pane HTML dashboard where **Summary** is the default landing view
+  (Virtual Servers + WAF applicability/enabled status), with policy deep-links
 - Baseline file must be a valid F5 policy XML export
 
 ### Bot Defense Mode (`--BOT`)
@@ -241,10 +245,11 @@ After a run, the `--output-dir` (default: sibling folder outside the repo, `../<
 │   ├── Common_app1_waf_20260303T1430.xml
 │   └── Common_app2_waf_20260303T1431.xml
 └── reports/
-    ├── WAF_audit_dashboard.html        # Single interactive multi-policy HTML dashboard
+    ├── WAF_audit_dashboard.html        # Three-pane HTML dashboard (Summary + Policies)
     ├── WAF_app1_waf_audit_report.md    # Per-policy Markdown report
     ├── WAF_app2_waf_audit_report.md
-    └── WAF_summary_audit_report.md     # Cross-policy summary (Markdown)
+    ├── WAF_summary_audit_report.md     # Cross-policy summary (Markdown)
+    └── WAF_virtual_server_summary.md   # Virtual Server WAF applicability/enabled summary
 ```
 
 **Bot Defense mode:**
@@ -264,7 +269,11 @@ After a run, the `--output-dir` (default: sibling folder outside the repo, `../<
 
 Notes:
 - HTML output is generated as one interactive dashboard file per run (`WAF_audit_dashboard.html` or `BOT_audit_dashboard.html`).
-- Markdown output is generated per policy/profile, plus a summary Markdown report.
+- In WAF mode, the dashboard defaults to a **Summary** view with all discovered Virtual Servers,
+  WAF status badges (`Not Applicable`, `WAF Capable`, `WAF Enabled`), and expandable
+  FQDN/Host-to-policy mappings for ASM-enabled LTM policy rules.
+- Markdown output is generated per policy/profile, plus summary report(s). WAF markdown now
+  also includes `WAF_virtual_server_summary.md`.
 - If GitLab source-of-truth comparison is enabled and source files exist, additional reports are written under `<output-dir>/source_of_truth/reports/`.
 
 ## GitLab Policy-State Repository Layout
@@ -376,6 +385,7 @@ src/
 ├── main.py                  # CLI entry point (argparse, audit mode dispatch)
 ├── bigip_client.py          # iControl REST client (token auth, chunked transfers)
 ├── policy_exporter.py       # WAF policy discovery + async export workflow
+├── virtual_server_inventory.py # WAF virtual server + LTM policy/host mapping inventory (read-only)
 ├── policy_parser.py         # XML → normalized Python dict (lxml / stdlib fallback)
 ├── policy_comparator.py     # WAF diff engine → ComparisonResult + DiffItem dataclasses
 ├── bot_defense_auditor.py   # Bot Defense profile discovery + REST fetch workflow
