@@ -347,24 +347,29 @@ def generate_html_dashboard(
 
     css = _DASHBOARD_CSS
     detail_templates = "".join(policy_templates)
+    mode_label = "BOT" if is_bot else "WAF"
+    title_label = "Bot Defense Audit Dashboard" if is_bot else "WAF Audit Dashboard"
+    sidebar_heading = "Bot Defense Profiles" if is_bot else "Navigation"
 
     html_doc = (
         "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
-        f"<title>{'Bot Defense' if is_bot else 'WAF'} Audit Dashboard</title>"
+        f"<title>{title_label}</title>"
         f"<style>{css}</style>"
         "</head><body>"
-        "<header class='topbar' role='banner'>"
-        f"<div class='top-title'>{'Bot Defense' if is_bot else 'WAF'} Audit Dashboard</div>"
-        "<div class='top-meta'>"
-        f"<span><strong>Device:</strong> {_esc(device_hostname)} ({_esc(device_mgmt_ip)})</span>"
-        f"<span><strong>Mode:</strong> {'BOT' if is_bot else 'WAF'}</span>"
-        f"<span><strong>Timestamp:</strong> {_esc(audit_timestamp)}</span>"
-        f"<span><strong>Pass/Fail:</strong> {pass_count}/{fail_count}</span>"
+        "<div class='app'>"
+        "<header class='title-pane' role='banner'>"
+        f"<h1>{title_label}</h1>"
+        "<div class='title-meta'>"
+        f"<div><strong>Device:</strong> {_esc(device_hostname)} ({_esc(device_mgmt_ip)})</div>"
+        f"<div><strong>Mode:</strong> {mode_label}</div>"
+        f"<div><strong>Generated:</strong> {_esc(audit_timestamp)}</div>"
+        f"<div><strong>Pass/Fail:</strong> {pass_count}/{fail_count}</div>"
         "</div>"
         "</header>"
-        "<div class='shell'>"
+        "<div class='body-grid'>"
         "<nav class='sidebar' role='navigation' aria-label='Audit navigation'>"
-        f"<div class='policy-nav'>{''.join(nav_items)}</div>"
+        f"<h2>{sidebar_heading}</h2>"
+        f"<div class='nav-list'>{''.join(nav_items)}</div>"
         "</nav>"
         "<main class='main' role='main'>"
         f"{summary_content}"
@@ -372,6 +377,7 @@ def generate_html_dashboard(
         "<section id='detail-view' class='view detail-view' role='region' aria-label='Policy details'></section>"
         f"{detail_templates}"
         "</main>"
+        "</div>"
         "</div>"
         f"<script id='policy-path-map' type='application/json'>{_esc(json.dumps(policy_path_to_id))}</script>"
         "<script>"
@@ -387,14 +393,22 @@ def generate_html_dashboard(
         "views.forEach(function(view){view.classList.toggle('active',view.id===viewId);});"
         "}"
         "function showView(viewId){"
-        "if(viewId==='summary-view'||viewId==='run-info-view'){detail.innerHTML='';setActive(viewId);window.location.hash=viewId;return;}"
+        "if(viewId==='summary-view'||viewId==='run-info-view'){detail.innerHTML='';setActive(viewId);"
+        "var m=document.querySelector('.main');if(m)m.scrollTop=0;window.location.hash=viewId;return;}"
         "var tpl=document.getElementById('tpl-'+viewId);"
         "if(!tpl){return;}"
         "detail.innerHTML=tpl.innerHTML;"
+        "bindDisclose(detail);"
         "setActive('detail-view');"
         "window.location.hash=viewId;"
-        "window.scrollTo({top:0,behavior:'smooth'});"
+        "var m=document.querySelector('.main');if(m)m.scrollTop=0;"
         "}"
+        "function bindDisclose(root){"
+        "(root||document).querySelectorAll('.disclose-sum').forEach(function(sum){"
+        "sum.addEventListener('click',function(){sum.closest('.disclose').classList.toggle('open');});"
+        "});"
+        "}"
+        "bindDisclose(document);"
         "navItems.forEach(function(card){"
         "card.addEventListener('click', function(){"
         "var target=card.getAttribute('data-view');"
@@ -417,7 +431,7 @@ def generate_html_dashboard(
         "if(!detailRow){return;}"
         "var expanded=btn.getAttribute('aria-expanded')==='true';"
         "btn.setAttribute('aria-expanded', expanded?'false':'true');"
-        "btn.textContent=expanded?'+':'−';"
+        "btn.textContent=expanded?'+':'\\u2212';"
         "detailRow.hidden=expanded;"
         "});"
         "var filterInput=document.getElementById('vs-filter');"
@@ -470,9 +484,10 @@ def _build_virtual_server_summary_section(
 
     if inventory_error:
         return (
-            "<div class='inventory-banner' role='alert'>"
-            "Virtual server inventory was unavailable for this run. "
-            f"Details: {_esc(inventory_error)}"
+            "<div class='pb-banner pb-disabled' role='alert'>"
+            "<span class='g'>&#9888;</span>"
+            "<span>Virtual server inventory was unavailable for this run. "
+            f"Details: {_esc(inventory_error)}</span>"
             "</div>"
         )
 
@@ -577,7 +592,13 @@ def _build_virtual_server_summary_section(
             )
 
     return (
-        "<h2>Virtual Server Summary</h2>"
+        "<h1>WAF Audit Summary</h1>"
+        "<div class='pb-banner pb-manual'>"
+        "<span class='g'>&#9888;</span>"
+        "<span>Virtual Server inventory is read-only and reflects ASM/AWAF applicability at audit time. "
+        "Expand a row to see policy attachments.</span>"
+        "</div>"
+        "<h2 class='sec-h2'>Virtual Server Summary</h2>"
         "<div class='vs-controls'>"
         "<label for='vs-filter'>Filter:</label>"
         "<input id='vs-filter' type='text' placeholder='Search virtual servers, partitions, destination, or policy'>"
@@ -649,7 +670,6 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
         SEVERITY_INFO: "Informational",
     }
 
-    # 1 — Metadata table
     raw_score = f"{result.raw_score:.1f}%" if result.is_hard_fail else "—"
     cb_text = ", ".join(result.circuit_breakers_triggered) if result.circuit_breakers_triggered else "None"
 
@@ -657,72 +677,101 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
     mode_is_blocking = "block" in mode_text
     mode_label = "Blocking" if mode_is_blocking else "Transparent"
     mode_cls = "mode-blocking" if mode_is_blocking else "mode-transparent"
-    enforcement_badge = f"<span class='policy-mode {mode_cls}'>{mode_label}</span>"
+    enforcement_badge = f"<span class='pill {mode_cls}'>{mode_label}</span>"
     learning_badge = _learning_mode_badge(getattr(result, "learning_mode", ""))
+    pass_flag = result.score >= 90.0
+    score_badge = f"<span class='badge badge-{'pass' if pass_flag else 'fail'}'>{'PASS' if pass_flag else 'FAIL'}</span>"
+    compliance_label = "Compliant" if pass_flag else "Needs Review"
+    compliance_cls = "status-compliant" if pass_flag else "status-review"
 
-    meta_table = "".join([
-        "<table class='results legacy-meta'><tbody>",
-        f"<tr><th>Partition</th><td>{_esc(result.partition)}</td><th>Baseline</th><td>{_esc(result.baseline_name)}</td></tr>",
-        f"<tr><th>Enforcement Mode</th><td>{enforcement_badge}</td><th>Learning Mode</th><td>{learning_badge}</td></tr>",
-        f"<tr><th>Audit Date</th><td>{_esc(result.timestamp)}</td><th>Score</th><td>{result.score:.1f}%</td></tr>",
-        f"<tr><th>Raw Score</th><td>{raw_score}</td><th>Circuit Breakers</th><td>{_esc(cb_text)}</td></tr>",
+    # Meta card with score bar
+    meta_card = "".join([
+        "<div class='meta-card'><table><tbody>",
+        f"<tr><td>Partition</td><td>{_esc(result.partition)}</td>",
+        f"<td>Enforcement Mode</td><td>{enforcement_badge}</td></tr>",
+        f"<tr><td>Baseline</td><td>{_esc(result.baseline_name)}</td>",
+        f"<td>Audit Date</td><td>{_esc(result.timestamp)}</td></tr>",
+        f"<tr><td>Learning Mode</td><td>{learning_badge}</td>",
+        f"<td>Raw Score</td><td>{raw_score}</td></tr>",
+        f"<tr><td>Circuit Breakers</td><td>{_esc(cb_text)}</td>",
+        f"<td>Compliance Score</td><td><strong>{result.score:.1f}%</strong> {score_badge}</td></tr>",
+        f"<tr><td>Status</td><td><span class='pill {compliance_cls}'>{compliance_label}</span></td><td></td><td></td></tr>",
         "</tbody></table>",
+        f"<div class='score-bar'><div class='score-fill {'score-pass' if pass_flag else 'score-fail'}' style='width:{result.score:.1f}%'></div></div>",
+        "</div>",
     ])
 
-    # 6 — Findings by severity summary count table
+    # Findings summary count table
     summary_rows = ""
     for sev in sev_order:
         count = len([d for d in result.findings if d.severity == sev])
         summary_rows += f"<tr><td>{sev_labels[sev]}</td><td>{count}</td></tr>"
 
-    # 7 — Individual finding sections (always expanded)
+    _sev_badge_cls = {
+        SEVERITY_CRITICAL: "critical",
+        SEVERITY_HIGH: "critical",
+        SEVERITY_WARNING: "warning",
+        SEVERITY_INFO: "info",
+    }
+
+    # Individual finding sections wrapped in disclose collapsibles
     finding_sections: List[str] = []
     for sev in sev_order:
         items = [d for d in result.findings if d.severity == sev]
         if not items:
             continue
+        badge_cls = _sev_badge_cls.get(sev, "info")
         rows = []
         for diff in items:
             rows.append(
                 "<tr>"
-                f"<td>{_esc(diff.section)}</td>"
+                f"<td><code>{_esc(diff.section)}</code></td>"
                 f"<td>{_esc(diff.element_name)}</td>"
                 f"<td><code>{_esc(diff.attribute)}</code></td>"
                 f"<td>{_esc(human_bool(diff.baseline_value))}</td>"
                 f"<td>{_esc(human_bool(diff.target_value))}</td>"
                 f"<td>{_esc(diff.description)}</td>"
+                f"<td><span class='badge badge-{badge_cls}'>{sev_labels[sev].upper()}</span></td>"
                 "</tr>"
             )
         finding_sections.append(
-            "<section>"
-            f"<h3 class='section-heading'>{sev_labels[sev]} Findings ({len(items)})</h3>"
-            "<table class='results legacy-findings'>"
+            "<div class='disclose open'>"
+            "<div class='disclose-sum'>"
+            f"<span class='caret'>&#9654;</span>"
+            f"<span class='badge badge-{badge_cls}'>{sev_labels[sev]} Findings</span>&nbsp;({len(items)})"
+            "</div>"
+            "<div class='disclose-body'>"
+            "<table class='findings'>"
             "<thead><tr>"
-            "<th>Section</th><th>Element</th><th>Attribute</th><th>Baseline</th><th>Target</th><th>Description</th>"
+            "<th>Section</th><th>Element</th><th>Attribute</th><th>Baseline</th><th>Target</th><th>Description</th><th>Severity</th>"
             "</tr></thead><tbody>"
             + "".join(rows) +
-            "</tbody></table></section>"
+            "</tbody></table>"
+            "</div></div>"
         )
 
     id_attr = f" id='{_esc(section_id)}'" if section_id else ""
     is_waf = getattr(result, "profile_type", "waf") == "waf"
 
-    parts: List[str] = [f"<div class='legacy-policy-panel'{id_attr}>", meta_table]
+    parts: List[str] = [
+        f"<div class='legacy-policy-panel'{id_attr}>",
+        meta_card,
+    ]
 
     if is_waf:
         parts += [
-            "<h3 class='section-heading'>WAF Violations — Learn / Alarm / Block</h3>",
+            "<h2 class='sec-h2'>WAF Violations — Learn / Alarm / Block</h2>",
             _build_waf_violations_grouped_html(result),
-            "<h3 class='section-heading'>WAF Violations vs Baseline</h3>",
+            "<h2 class='sec-h2'>WAF Violations vs Baseline</h2>",
             _build_waf_violation_table_html(result),
-            "<h3 class='section-heading'>Applied Attack Signature Sets</h3>",
+            "<h2 class='sec-h2'>Applied Attack Signature Sets</h2>",
             _build_signature_sets_html(result),
         ]
 
     parts += [
-        "<h3 class='section-heading'>Audit Log (Last 10 Changes)</h3>",
+        "<h2 class='sec-h2'>Audit Log (Last 10 Changes)</h2>",
         _build_audit_log_html(result),
-        "<h3 class='section-heading'>Findings by Severity</h3>",
+        "<h2 class='sec-h2'>Findings by Severity</h2>",
         "<table class='results legacy-summary'><thead><tr><th>Severity</th><th>Count</th></tr></thead><tbody>",
         summary_rows,
         "</tbody></table>",
@@ -919,94 +968,139 @@ def _build_audit_log_html(result: ComparisonResult) -> str:
 
 
 _DASHBOARD_CSS = """
-html{scroll-behavior:smooth}
-body{font-family:Arial,Helvetica,sans-serif;background:#f7f7fb;color:#222;padding:12px 20px;margin:0}
-h1{margin-top:0;margin-bottom:12px}
-h2{margin:16px 0 8px}
-/* Topbar */
-.topbar{background:#0f3460;color:#fff;padding:10px 16px;border-radius:8px;margin-bottom:12px;display:flex;flex-wrap:wrap;align-items:center;gap:12px;justify-content:space-between}
-.top-title{font-weight:700;font-size:18px}
-.top-meta{display:flex;flex-wrap:wrap;gap:14px;font-size:13px}
-/* Shell layout — sidebar + main side by side */
-.shell{display:flex;gap:18px;align-items:flex-start}
-.sidebar{width:280px;flex-shrink:0;position:sticky;top:12px;max-height:calc(100vh - 24px);overflow-y:auto;background:#fff;border:1px solid #d9dfea;border-radius:8px;padding:12px}
-.main{flex:1;min-width:0}
-/* View visibility — all views hidden; only .active shown */
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;scroll-behavior:smooth}
+body{font-family:Arial,Helvetica,sans-serif;background:#f7f7fb;color:#222}
+/* ---- App shell ---------------------------------------------------------- */
+.app{height:100vh;display:grid;grid-template-rows:auto 1fr;overflow:hidden}
+/* ---- Title pane --------------------------------------------------------- */
+.title-pane{background:#16213e;color:#fff;padding:12px 18px;border-bottom:1px solid #0f3460;display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.title-pane h1{color:#fff;margin:0;font-size:1.2rem;font-weight:700}
+.title-meta{font-size:.86rem;display:flex;gap:22px;flex-wrap:wrap;color:#cdd6e8}
+.title-meta strong{color:#fff;font-weight:700}
+/* ---- Body grid ---------------------------------------------------------- */
+.body-grid{min-height:0;display:grid;grid-template-columns:300px 1fr}
+.sidebar{background:#fff;border-right:1px solid #d9dde5;padding:12px;overflow-y:auto}
+.sidebar h2{margin:0 0 10px;font-size:1rem;color:#16213e;font-weight:700}
+.main{overflow:auto;padding:18px}
+/* ---- View visibility ---------------------------------------------------- */
 .view{display:none}
 .view.active{display:block}
-/* Nav items */
+/* ---- Nav items ---------------------------------------------------------- */
+.nav-list{display:flex;flex-direction:column;gap:6px}
 .policy-nav{display:flex;flex-direction:column;gap:6px}
 .nav-group-title{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#7a8fa6;font-weight:700;padding:8px 4px 2px;margin-top:2px}
-.nav-item{display:block;width:100%;text-align:left;padding:8px 10px;border:1px solid #d8deeb;border-radius:6px;background:#f8fafe;cursor:pointer;font:inherit;font-size:13px;color:#1f2b3d;transition:border-color .15s,box-shadow .15s;appearance:none;-webkit-appearance:none;box-sizing:border-box}
+.nav-item{display:block;width:100%;text-align:left;padding:9px 10px;border:1px solid #d8deeb;border-radius:6px;background:#f8fafe;cursor:pointer;font:inherit;font-size:13px;color:#1f2b3d;transition:border-color .15s,box-shadow .15s,background .15s;appearance:none;-webkit-appearance:none;box-sizing:border-box}
 .nav-item:hover{border-color:#5b77ad;box-shadow:0 0 0 2px rgba(15,52,96,.12)}
 .nav-item.active{border-color:#0f3460;background:#e6edf7;box-shadow:0 0 0 2px rgba(15,52,96,.2);font-weight:700}
-.nav-policy{display:flex;flex-direction:column;gap:2px}
+.nav-policy{display:flex;flex-direction:column;gap:3px}
 .nav-policy-path{font-weight:600;word-break:break-all;font-size:13px}
-.nav-policy-meta{font-size:11px;color:#5f6570}
+.nav-policy-meta{font-size:11px;color:#5f6570;display:flex;justify-content:space-between;align-items:center;gap:8px}
 .nav-item.active .nav-policy-meta{color:#2a4a7f}
-/* Legacy card classes kept for back-compat */
-.policy-card{display:block;text-decoration:none;color:#1f2b3d;border:1px solid #d8deeb;border-radius:8px;background:#f8fafe;padding:10px;transition:border-color .15s,box-shadow .15s;cursor:pointer;font:inherit;text-align:left;width:100%;appearance:none;-webkit-appearance:none}
-.policy-card:hover{border-color:#5b77ad;box-shadow:0 0 0 2px rgba(15,52,96,.15)}
-.policy-card.active{border-color:#0f3460;box-shadow:0 0 0 2px rgba(15,52,96,.25)}
-.policy-card-title{font-weight:700;margin-bottom:6px;word-break:break-word}
-.policy-card-meta{display:grid;gap:4px;font-size:12px}
-.policy-card-badges{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}
-.policy-mode{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700;width:fit-content}
-.policy-status{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700;width:fit-content}
+/* ---- Badges ------------------------------------------------------------- */
+.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:.78em;font-weight:700;color:#fff;white-space:nowrap}
+.badge-critical{background:#dc3545}
+.badge-warning{background:#fd7e14}
+.badge-info{background:#17a2b8}
+.badge-pass{background:#28a745}
+.badge-fail{background:#dc3545}
+.badge-unknown{background:#6c757d}
+/* ---- Pills -------------------------------------------------------------- */
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
 .status-compliant{background:#d4edda;color:#155724}
 .status-review{background:#ffe8a1;color:#7a5a00}
-.mode-blocking{background:#d4edda;color:#155724}
-.mode-transparent{background:#ffe9a8;color:#7a5a00}
-/* Status badges for VS table */
-.status-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700}
 .status-enabled{background:#d4edda;color:#155724}
 .status-capable{background:#cce5ff;color:#004085}
 .status-na{background:#e9ecef;color:#495057}
-.summary-card{background:#eef5ff}
-table.results{border-collapse:collapse;width:100%;background:#fff;border:1px solid #ddd}
-table.results th,table.results td{padding:10px;border-bottom:1px solid #eee;text-align:left}
+.mode-blocking{background:#d4edda;color:#155724}
+.mode-transparent{background:#ffe9a8;color:#7a5a00}
+/* legacy compat */
+.policy-mode{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700;width:fit-content}
+.status-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700}
+/* ---- Meta card + score bar ---------------------------------------------- */
+.meta-card{background:#fff;border:1px solid #e6e9f0;border-radius:6px;padding:16px;margin-bottom:18px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.meta-card table{border-collapse:collapse;width:100%}
+.meta-card td{padding:4px 10px;vertical-align:top;font-size:13px}
+.meta-card td:first-child{font-weight:700;color:#555;width:180px}
+.score-bar{height:24px;border-radius:4px;background:#e0e0e0;overflow:hidden;margin:10px 0 0}
+.score-fill{height:100%;transition:width .5s ease}
+.score-pass{background:#28a745}
+.score-fail{background:#dc3545}
+/* ---- Headings ----------------------------------------------------------- */
+h1{font-size:1.3rem;color:#1a1a2e;margin:0 0 12px}
+h2{margin:16px 0 8px}
+.sec-h2{color:#16213e;margin:24px 0 8px;border-bottom:2px solid #e0e0e0;padding-bottom:4px;font-size:1.12rem}
+.sec-h3{color:#0f3460;margin:14px 0 6px;font-size:1rem}
+.section-heading{margin:18px 0 8px;padding-bottom:4px;border-bottom:2px solid #d9dfea;color:#0f3460}
+/* ---- Tables ------------------------------------------------------------- */
+table.results{border-collapse:collapse;width:100%;background:#fff;border:1px solid #ddd;font-size:13px}
+table.results th,table.results td{padding:9px 10px;border-bottom:1px solid #eee;text-align:left}
 table.results th{background:#0f3460;color:#fff}
 table.results.nested th{background:#2a5a8c}
+table.results tr.vs-row:hover{background:#f3f6fc}
+table.findings{width:100%;border-collapse:collapse;margin:8px 0;font-size:.9em}
+table.findings th{background:#1a1a2e;color:#fff;padding:8px 10px;text-align:left}
+table.findings td{padding:7px 10px;border-bottom:1px solid #e0e0e0;vertical-align:top}
+table.findings tr:nth-child(even){background:#f9f9f9}
+table.findings tr:hover{background:#eef3ff}
 tr.tier-red{background:#dc3545;color:#fff}
 tr.tier-amber{background:#fd7e14;color:#fff}
 tr.tier-yellow{background:#ffc107;color:#000}
 tr.tier-green{background:#28a745;color:#fff}
 tr.tier-yellow td{border-color:#f5d86a}
-tr.tier-red a, tr.tier-amber a, tr.tier-green a{color:#fff;font-weight:bold}
-/* VS table controls */
-.expand-col{width:32px}
-.vs-toggle{background:none;border:1px solid #b0b8cb;border-radius:4px;width:22px;height:22px;cursor:pointer;font-weight:bold;font-size:14px;line-height:1;padding:0;color:#0f3460}
+tr.tier-red a,tr.tier-amber a,tr.tier-green a{color:#fff;font-weight:bold}
+tr.band td{background:#e8ecf5;font-weight:700;color:#16213e;padding:6px 10px}
+.legacy-meta th{width:180px;background:#f8fafe;color:#22314f}
+.legacy-summary{max-width:420px;margin-bottom:10px}
+.legacy-findings th,.legacy-findings td{font-size:13px}
+.violation-compare th,.violation-compare td{font-size:12px}
+/* ---- VS table controls -------------------------------------------------- */
+.expand-col{width:34px}
+.vs-toggle{background:none;border:1px solid #b0b8cb;border-radius:4px;width:22px;height:22px;cursor:pointer;font-weight:700;font-size:14px;line-height:1;padding:0;color:#0f3460}
 .vs-toggle:hover{background:#e6edf7}
 .vs-detail-row>td{background:#f3f6fc;border-top:2px solid #d9dfea;padding:0}
 .vs-detail-panel{padding:10px 14px}
-.vs-controls{margin-bottom:10px;display:flex;align-items:center;gap:8px}
-.vs-controls label{font-size:13px;font-weight:600}
-.vs-controls input{padding:6px 10px;border:1px solid #d9dfea;border-radius:4px;font-size:13px;width:300px}
+.vs-controls{margin:6px 0 10px;display:flex;align-items:center;gap:8px}
+.vs-controls label{font-size:13px;font-weight:600;color:#444}
+.vs-controls input{padding:7px 10px;border:1px solid #d9dfea;border-radius:4px;font-size:13px;width:320px;font-family:inherit}
 .sort-btn{background:none;border:none;cursor:pointer;font-weight:700;color:#fff;padding:0;font:inherit;font-size:inherit}
 .sort-btn:hover{text-decoration:underline}
+/* ---- Collapsible sections ----------------------------------------------- */
+.disclose{background:#fff;border:1px solid #ddd;border-radius:6px;margin:10px 0}
+.disclose-sum{padding:12px 16px;cursor:pointer;font-weight:700;color:#16213e;display:flex;align-items:center;gap:8px;user-select:none}
+.disclose-sum .caret{font-size:.8em;transition:transform .2s;color:#0f3460}
+.disclose.open .disclose-sum .caret{transform:rotate(90deg)}
+.disclose-body{padding:4px 16px 16px}
+.disclose:not(.open) .disclose-body{display:none}
+/* ---- Banners ------------------------------------------------------------ */
+.pb-banner{border-radius:6px;padding:12px 16px;margin:14px 0;display:flex;align-items:center;gap:12px;font-size:14px}
+.pb-banner .g{font-size:18px;line-height:1}
+.pb-manual{background:#fff3cd;border:1px solid #ffc107;color:#7a5a00}
+.pb-automatic{background:#d4edda;border:1px solid #28a745}
+.pb-disabled{background:#f8d7da;border:1px solid #dc3545;color:#721c24}
+.pb-unknown{background:#e2e3e5;border:1px solid #adb5bd}
+.inventory-banner{background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px 16px;color:#7a5a00;margin-bottom:12px}
+/* ---- Summary bar -------------------------------------------------------- */
 .summary-bar{display:flex;gap:12px;margin:12px 0;font-weight:bold}
 .summary-bar span{padding:6px 10px;border-radius:4px;color:#fff}
 .summary-bar .tier-red{background:#dc3545}
 .summary-bar .tier-amber{background:#fd7e14}
 .summary-bar .tier-yellow{background:#ffc107;color:#000}
 .summary-bar .tier-green{background:#28a745}
-.muted{color:#5f6570}
-.legacy-policy{margin-top:10px;border:1px solid #d9dfea;border-radius:6px;background:#fff}
-.legacy-policy>summary{cursor:pointer;padding:10px 12px;font-weight:bold;background:#f3f6fc}
-.details-body{padding:10px 12px}
-.legacy-meta th{width:180px;background:#f8fafe;color:#22314f}
-.legacy-summary{max-width:420px;margin-bottom:10px}
-.legacy-findings th,.legacy-findings td{font-size:13px}
-.violation-compare th,.violation-compare td{font-size:12px}
-.inventory-banner{background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px 16px;color:#7a5a00;margin-bottom:12px}
+/* ---- Policy detail panel ------------------------------------------------ */
 .legacy-policy-panel{margin-top:10px;border:1px solid #d9dfea;border-radius:6px;background:#fff;padding:12px 16px}
-.section-heading{margin:18px 0 8px;padding-bottom:4px;border-bottom:2px solid #d9dfea;color:#0f3460}
+/* ---- Violation cards ---------------------------------------------------- */
 .violation-cards{display:flex;gap:16px;flex-wrap:wrap}
 .vcard{flex:1;min-width:200px;border:1px solid #d9dfea;border-radius:6px;padding:10px;background:#f8fafe}
 .vcard-title{font-weight:700;margin-bottom:6px;font-size:14px}
 .vcard-title.learn{color:#0f3460}
 .vcard-title.alarm{color:#fd7e14}
 .vcard-title.block{color:#dc3545}
+/* ---- Misc --------------------------------------------------------------- */
+.muted{color:#5f6570}
+code{font-family:ui-monospace,Menlo,Consolas,monospace}
+.policy-jump{color:#0f3460;cursor:pointer;text-decoration:underline}
+.summary-card{background:#eef5ff}
 """
 
 
