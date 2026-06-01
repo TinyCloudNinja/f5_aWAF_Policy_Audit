@@ -237,24 +237,41 @@ def _inspector_to_target_dict(inspection: Dict) -> Dict:
     empty values so the comparator does not generate false-positive findings for
     data that was never fetched.
     """
-    # Merge per-flag violation lists back into a single list with boolean flags.
-    # The inspector groups violations as learn/alarm/block; the comparator expects
-    # each violation once with all three flags set appropriately.
-    merged_violations: Dict[str, Dict] = {}
-    for flag in ("learn", "alarm", "block"):
-        for item in inspection.get("violations", {}).get(flag, []):
-            name = item.get("name", "")
-            if not name:
-                continue
-            if name not in merged_violations:
-                merged_violations[name] = {
-                    "name":        name,
-                    "description": item.get("description", ""),
-                    "alarm":       False,
-                    "block":       False,
-                    "learn":       False,
-                }
-            merged_violations[name][flag] = True
+    # Build a single violations dict with all three flag values per violation.
+    # Prefer the "all" list (added in inspector v2) which includes violations
+    # whose flags are all False — those would otherwise be silently dropped and
+    # misreported as "missing from target" by the comparator.
+    violations_data = inspection.get("violations", {})
+    all_viols = violations_data.get("all", [])
+    if all_viols:
+        merged_violations: Dict[str, Dict] = {
+            v["name"]: {
+                "name":        v["name"],
+                "description": v.get("description", ""),
+                "alarm":       bool(v.get("alarm", False)),
+                "block":       bool(v.get("block", False)),
+                "learn":       bool(v.get("learn", False)),
+            }
+            for v in all_viols if v.get("name")
+        }
+    else:
+        # Backward-compat: reconstruct from per-flag lists (pre-"all" inspector).
+        # Violations with all flags False are absent here — acceptable for old data.
+        merged_violations = {}
+        for flag in ("learn", "alarm", "block"):
+            for item in violations_data.get(flag, []):
+                name = item.get("name", "")
+                if not name:
+                    continue
+                if name not in merged_violations:
+                    merged_violations[name] = {
+                        "name":        name,
+                        "description": item.get("description", ""),
+                        "alarm":       False,
+                        "block":       False,
+                        "learn":       False,
+                    }
+                merged_violations[name][flag] = True
 
     return {
         "general":           {"enforcementMode": inspection.get("enforcementMode", "transparent")},

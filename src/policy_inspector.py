@@ -195,6 +195,7 @@ class PolicyInspector:
         learn: List[Dict] = []
         alarm: List[Dict] = []
         block: List[Dict] = []
+        all_items_full: List[Dict] = []
 
         for item in all_items:
             # name = canonical machine ID (e.g. VIRUS_DETECTED); used as join key.
@@ -209,16 +210,37 @@ class PolicyInspector:
                         raw_desc, viol_name,
                     )
             desc  = item.get("description", viol_name)
-            entry = {"description": desc, "name": viol_name or desc}
+            # Per-flag display entries (name + description only)
+            display_entry = {"description": desc, "name": viol_name or desc}
+            # Full entry with all three flag values — used by _inspector_to_target_dict
+            # to include ALL violations (including default all-False ones) in the target
+            # dict so the comparator does not report them as "missing from target".
+            full_entry = {
+                "name":        viol_name or desc,
+                "description": desc,
+                "alarm":       bool(item.get("alarm", False)),
+                "block":       bool(item.get("block", False)),
+                "learn":       bool(item.get("learn", False)),
+            }
+            all_items_full.append(full_entry)
 
             if item.get("learn"):
-                learn.append(entry)
+                learn.append(display_entry)
             if item.get("alarm"):
-                alarm.append(entry)
+                alarm.append(display_entry)
             if item.get("block"):
-                block.append(entry)
+                block.append(display_entry)
 
-        return {"learn": learn, "alarm": alarm, "block": block}, []
+        return {
+            "learn": learn,
+            "alarm": alarm,
+            "block": block,
+            # "all" carries every violation with its actual flag state.  Used by
+            # _inspector_to_target_dict so violations in their default off-state
+            # (alarm=False, block=False, learn=False) are not silently dropped and
+            # misreported as "missing from target" by the comparator.
+            "all":   all_items_full,
+        }, []
 
     def _fetch_signature_sets(self, policy_id: str) -> Tuple[List, List[str]]:
         """GET signature-sets applied to the policy."""
