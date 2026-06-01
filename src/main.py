@@ -27,6 +27,7 @@ from .utils import (
 from .bigip_client import BigIPClient, AuthenticationError
 from .policy_exporter import PolicyExporter, ExportError
 from .policy_inspector import PolicyInspector, print_inspection_table
+from .policy_fetcher import PolicyFetcher
 from .policy_comparator import compare_policies
 from .bot_defense_auditor import BotDefenseAuditor
 from .bot_defense_comparator import compare_bot_profiles
@@ -667,7 +668,7 @@ def _run_waf_audit(
     fail_on_tier: str,
     pass_threshold: float,
 ) -> int:
-    """Run the ASM/AWAF policy audit (Phase 1: PolicyInspector for both baseline and targets)."""
+    """Run the ASM/AWAF policy audit (Phase 3: PolicyFetcher for full API-driven data)."""
     virtual_server_inventory: list = []
     virtual_server_inventory_error: Optional[str] = None
 
@@ -684,11 +685,8 @@ def _run_waf_audit(
         client.close()
         return 0
 
-    # Enrich all policies with virtual server bindings before interactive selection.
     exporter.enrich_with_virtual_servers(all_policies)
 
-    # Collect VS inventory, reusing the ASM policies payload already fetched by
-    # discover_policies to avoid a duplicate /mgmt/tm/asm/policies request.
     try:
         logger.info("Collecting virtual server inventory …")
         virtual_server_inventory = collect_virtual_server_inventory(
@@ -724,39 +722,39 @@ def _run_waf_audit(
 
     exporter.print_discovery_table(target_policies)
 
-    # ── Inspect baseline policy ────────────────────────────────────────────────
-    inspector = PolicyInspector(client=client, concurrent=5, audit_limit=10)
-    logger.info("Inspecting baseline policy: %s", baseline_name)
-    baseline_inspection = inspector.inspect_one(baseline_policy)
-    if baseline_inspection.get("errors"):
-        logger.error("Baseline inspection errors: %s", baseline_inspection["errors"])
+    # ── Fetch baseline via full API-driven fetcher ─────────────────────────────
+    fetcher = PolicyFetcher(client=client, concurrent=5)
+    logger.info("Fetching baseline policy: %s", baseline_name)
+    try:
+        baseline_data = fetcher.fetch_waf_policy(baseline_policy)
+    except Exception as exc:
+        logger.error("Baseline fetch failed for %s: %s", baseline_name, exc)
         client.close()
         return 1
-    baseline_data = _inspector_to_target_dict(baseline_inspection)
 
-    # ── Inspect all target policies ────────────────────────────────────────────
-    logger.info("Inspecting %d target policies via REST …", len(target_policies))
-    inspections   = inspector.inspect_all(target_policies)
-    inspection_map = {r["fullPath"]: r for r in inspections}
+    n_viols   = len(baseline_data.get("blocking-settings", {}).get("violations", []))
+    n_sigsets = len(baseline_data.get("signature-sets", []))
+    print(f"✓ Baseline fetched: {baseline_name}  ({n_viols} violations, {n_sigsets} sig sets)")
 
-    # ── Compare and report ─────────────────────────────────────────────────────
+    # ── Fetch, compare, and report each target policy ──────────────────────────
     all_results: list = []
     sot_results: list = []
+    fetch_failures = 0
     total = len(target_policies)
 
     for idx, policy in enumerate(target_policies, 1):
         full_path = policy["fullPath"]
-        inspection = inspection_map.get(full_path)
-        if not inspection:
-            logger.error("No inspection result for %s — skipping", full_path)
+        logger.info("Fetching policy %d/%d: %s", idx, total, full_path)
+
+        try:
+            target_data = fetcher.fetch_waf_policy(policy)
+        except Exception as exc:
+            logger.error("Fetch failed for %s: %s", full_path, exc)
+            fetch_failures += 1
+            short = full_path if len(full_path) <= 50 else "…" + full_path[-49:]
+            print(f"  [{idx}/{total}] {short}  FETCH FAILED")
             continue
 
-        if inspection.get("errors"):
-            logger.warning("Inspection errors for %s: %s", full_path, inspection["errors"])
-
-        logger.info("Auditing policy %d/%d: %s", idx, total, full_path)
-
-        target_data = _inspector_to_target_dict(inspection)
         meta = {
             "name":     policy["name"],
             "fullPath": policy["fullPath"],
@@ -771,12 +769,20 @@ def _run_waf_audit(
             virtual_servers=policy.get("virtual_servers", []),
             device_hostname=device_hostname,
             device_mgmt_ip=device_mgmt_ip,
-            asm_audit_logs=inspection.get("auditLog", []),
-            asm_audit_log_total=inspection.get("auditLogTotal", 0),
-            asm_audit_log_error=inspection.get("auditLogError"),
+            asm_audit_logs=[],
+            asm_audit_log_total=0,
+            asm_audit_log_error=None,
             green_threshold=pass_threshold,
         )
         all_results.append(cmp_result)
+
+        short = full_path if len(full_path) <= 47 else "…" + full_path[-46:]
+        print(
+            f"  [{idx}/{total}] {short:<49}  "
+            f"{cmp_result.score:>6.1f}%  "
+            f"{_TIER_EMOJI.get(cmp_result.tier, '')} {cmp_result.tier_label:<13}  "
+            f"{len(cmp_result.diffs)} diffs"
+        )
 
         if gitlab_state is not None:
             sot_baseline, sot_name = gitlab_state.load_waf_source_of_truth(full_path)
@@ -790,9 +796,9 @@ def _run_waf_audit(
                         virtual_servers=policy.get("virtual_servers", []),
                         device_hostname=device_hostname,
                         device_mgmt_ip=device_mgmt_ip,
-                        asm_audit_logs=inspection.get("auditLog", []),
-                        asm_audit_log_total=inspection.get("auditLogTotal", 0),
-                        asm_audit_log_error=inspection.get("auditLogError"),
+                        asm_audit_logs=[],
+                        asm_audit_log_total=0,
+                        asm_audit_log_error=None,
                         green_threshold=pass_threshold,
                     )
                     sot_results.append(sot_cmp_result)
@@ -802,14 +808,20 @@ def _run_waf_audit(
         if "markdown" in formats:
             generate_markdown(cmp_result, output_dir)
 
+    if fetch_failures == total:
+        logger.error("All %d policy fetch(es) failed. No results to report.", total)
+        client.close()
+        return 2
+
     if all_results:
         if "html" in formats:
-            generate_html_dashboard(
+            dashboard_path = generate_html_dashboard(
                 all_results,
                 output_dir,
                 virtual_server_inventory=virtual_server_inventory,
                 virtual_server_inventory_error=virtual_server_inventory_error,
             )
+            print(f"✓ Dashboard → {dashboard_path}")
         summary_formats = [f for f in formats if f != "html"]
         if summary_formats:
             generate_summary_reports(all_results, output_dir, summary_formats)
@@ -849,7 +861,7 @@ def _run_waf_audit(
             device_hostname=device_hostname,
             device_mgmt_ip=device_mgmt_ip,
             audited_count=len(all_results),
-            failure_count=0,
+            failure_count=fetch_failures,
         )
         gitlab_state.commit_and_push(
             commit_message=(
@@ -866,7 +878,7 @@ def _run_waf_audit(
         device_mgmt_ip=device_mgmt_ip,
         output_dir=output_dir,
         subject_label="Policy",
-        failure_label="policy inspection(s)",
+        failure_label="policy fetch(es)",
         pass_threshold=pass_threshold,
         fail_on_tier=fail_on_tier,
     )
@@ -944,6 +956,8 @@ def _run_bot_audit(
         client.close()
         return 1
 
+    print(f"✓ Baseline fetched: {baseline_name}")
+
     # ── Fetch target profiles ──────────────────────────────────────────────────
     successes, failures = auditor.fetch_all(target_profiles)
     if failures:
@@ -964,10 +978,8 @@ def _run_bot_audit(
     total = len(successes)
 
     for idx, (profile_meta, profile_data) in enumerate(successes, 1):
-        logger.info(
-            "Auditing Bot Defense profile %d/%d: %s",
-            idx, total, profile_meta["fullPath"],
-        )
+        full_path = profile_meta.get("fullPath", "")
+        logger.info("Auditing Bot Defense profile %d/%d: %s", idx, total, full_path)
         try:
             cmp_result = compare_bot_profiles(
                 baseline=baseline_data,
@@ -980,13 +992,20 @@ def _run_bot_audit(
                 green_threshold=pass_threshold,
             )
         except Exception as exc:
-            logger.error(
-                "Failed to compare Bot Defense profile %s: %s",
-                profile_meta["fullPath"], exc,
-            )
+            logger.error("Failed to compare Bot Defense profile %s: %s", full_path, exc)
+            short = full_path if len(full_path) <= 47 else "…" + full_path[-46:]
+            print(f"  [{idx}/{total}] {short}  COMPARE FAILED")
             continue
 
         all_results.append(cmp_result)
+
+        short = full_path if len(full_path) <= 47 else "…" + full_path[-46:]
+        print(
+            f"  [{idx}/{total}] {short:<49}  "
+            f"{cmp_result.score:>6.1f}%  "
+            f"{_TIER_EMOJI.get(cmp_result.tier, '')} {cmp_result.tier_label:<13}  "
+            f"{len(cmp_result.diffs)} diffs"
+        )
 
         if gitlab_state is not None:
             sot_baseline, sot_name = gitlab_state.load_bot_source_of_truth(profile_meta["fullPath"])
@@ -1014,7 +1033,8 @@ def _run_bot_audit(
 
     if all_results:
         if "html" in formats:
-            generate_html_dashboard(all_results, output_dir)
+            dashboard_path = generate_html_dashboard(all_results, output_dir)
+            print(f"✓ Dashboard → {dashboard_path}")
         summary_formats = [f for f in formats if f != "html"]
         if summary_formats:
             generate_summary_reports(all_results, output_dir, summary_formats)
