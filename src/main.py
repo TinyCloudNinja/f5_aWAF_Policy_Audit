@@ -1,16 +1,14 @@
 """
 CLI entry point for the F5 BIG-IP ASM/AWAF Security Policy Auditor.
 
-Changelog: Updated CLI for tiered compliance model with fail-on-tier exit codes,
-backward-compatible --pass-threshold (Green boundary), and tier-aware summary output.
+Changelog: Phase 1 refactor — interactive mode selection, device-side baseline
+selection, questionary prompts, and SSL verification bug fix.
 """
 
 import argparse
-import getpass
 import json
 import os
 import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -29,7 +27,6 @@ from .utils import (
 from .bigip_client import BigIPClient, AuthenticationError
 from .policy_exporter import PolicyExporter, ExportError
 from .policy_inspector import PolicyInspector, print_inspection_table
-from .policy_parser import parse_policy
 from .policy_comparator import compare_policies
 from .bot_defense_auditor import BotDefenseAuditor
 from .bot_defense_comparator import compare_bot_profiles
@@ -41,6 +38,12 @@ from .report_generator import (
 )
 from .gitlab_state import GitLabStateManager
 from .virtual_server_inventory import collect_virtual_server_inventory
+from .interactive import (
+    collect_run_parameters,
+    prompt_password,
+    prompt_mode,
+    get_device_version,
+)
 
 import urllib3
 
@@ -97,29 +100,31 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="f5-awaf-auditor",
         description=(
             "F5 BIG-IP Security Auditor — Read-only compliance audit of WAF policies "
-            "or Bot Defense profiles against a baseline.\n\n"
-            "Audit modes (mutually exclusive):\n"
-            "  --WAF   Audit ASM/AWAF security policies against an XML baseline (default)\n"
-            "  --BOT   Audit Bot Defense profiles against a JSON baseline"
+            "or Bot Defense profiles against a baseline selected from the device.\n\n"
+            "Audit modes (via --mode or interactive menu):\n"
+            "  WAF      Audit ASM/AWAF security policies\n"
+            "  BOT      Audit Bot Defense profiles\n"
+            "  INSPECT  Fast targeted REST inspection (no baseline required)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # Audit mode selection
-    mode_group = p.add_mutually_exclusive_group()
-    mode_group.add_argument(
-        "--WAF", dest="audit_mode", action="store_const", const="waf",
-        help="Audit ASM/AWAF security policies (default mode)",
+    p.add_argument(
+        "--mode",
+        dest="mode",
+        choices=["WAF", "BOT", "INSPECT", "waf", "bot", "inspect"],
+        default=None,
+        help="Audit mode. If omitted and stdin is a TTY, an interactive menu is shown.",
     )
-    mode_group.add_argument(
-        "--BOT", dest="audit_mode", action="store_const", const="bot",
-        help="Audit Bot Defense profiles against a JSON baseline",
-    )
-    mode_group.add_argument(
-        "--INSPECT", dest="audit_mode", action="store_const", const="inspect",
+    p.add_argument(
+        "--baseline-policy",
+        dest="baseline_policy",
+        metavar="FULLPATH",
+        default=None,
         help=(
-            "Inspect ASM/AWAF policies via targeted REST calls (no export task). "
-            "Emits <output-dir>/inspection.json. Does not require --baseline."
+            "Full path of the BST-prefixed baseline policy/profile on the device "
+            "(e.g. '~Common~BST_Corporate_Baseline'). "
+            "If omitted and stdin is a TTY, an interactive menu is shown."
         ),
     )
 
@@ -131,7 +136,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help=(
-            "Backward-compatible Green lower bound (default: 90). "
+            "Green lower bound (default: 90). "
             "Only shifts the Yellow/Green boundary; other bands remain fixed."
         ),
     )
@@ -142,7 +147,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Tier that triggers a non-zero exit code. "
-            "RED (default) fails on any Red policy; AMBER fails on Amber or worse, etc."
+            "RED (default) fails on any Red policy."
         ),
     )
 
@@ -152,31 +157,27 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="BIG-IP management IP or FQDN [env: BIGIP_HOST]")
     p.add_argument("--username", metavar="USER",
                    help="Admin username [env: BIGIP_USER]")
-    # NOTE: --password is intentionally absent. Supply credentials via the
-    # BIGIP_PASS environment variable or the interactive prompt to avoid
-    # exposing the password in the process table (ps aux).
-    p.add_argument("--baseline", metavar="FILE",
-                   help=(
-                       "Path to baseline file. "
-                       "XML for --WAF mode; JSON for --BOT mode."
-                   ))
+    p.add_argument(
+        "--password",
+        metavar="PASS",
+        default=None,
+        help=(
+            "BIG-IP password. Prefer BIGIP_PASS env var or the interactive prompt "
+            "to avoid exposing the password in the process table."
+        ),
+    )
     p.add_argument("--output-dir", metavar="DIR", default=None,
-                   help=f"Output directory for exports and reports (default: {_DEFAULT_OUTPUT_DIR})")
+                   help=f"Output directory (default: {_DEFAULT_OUTPUT_DIR})")
     p.add_argument("--format", dest="report_format",
                    choices=["html", "markdown", "both"], default=None,
                    help="Report format (default: both)")
-    p.add_argument("--partitions", metavar="P1,P2",
-                   help="Comma-separated partition names to audit (default: all)")
     p.add_argument("--verify-ssl", dest="verify_ssl", action="store_true",
-                   default=None, help="Enable TLS certificate verification (default)")
+                   default=None, help="Enable TLS certificate verification")
     p.add_argument("--no-verify-ssl", dest="verify_ssl", action="store_false",
-                   help="Disable TLS certificate verification (for self-signed certs)")
+                   help="Disable TLS certificate verification (default; for self-signed certs)")
     p.add_argument("--login-provider", dest="login_provider", metavar="PROVIDER",
                    default=None,
                    help="BIG-IP login provider name [env: BIGIP_LOGIN_PROVIDER] (default: tmos)")
-    p.add_argument("--concurrent-exports", dest="concurrent_exports",
-                   type=int, default=None, metavar="N",
-                   help="Max parallel inspection workers, 1–20 (default: 3)")
     p.add_argument("--gitlab-repo-url", dest="gitlab_repo_url", metavar="URL",
                    default=None,
                    help="GitLab repo URL used as source-of-truth + run archive")
@@ -191,42 +192,15 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Push policy-state commits to remote automatically")
     p.add_argument("--no-gitlab-auto-push", dest="gitlab_auto_push", action="store_false",
                    help="Do not push commits to remote automatically")
-    p.add_argument("--gitlab-update-source-truth", dest="gitlab_update_source_truth", action="store_true",
-                   default=None,
-                   help="Update source_of_truth files in the GitLab repo from current device exports")
-    p.add_argument("--no-gitlab-update-source-truth", dest="gitlab_update_source_truth", action="store_false",
-                   help="Do not update source_of_truth files from current exports")
+    p.add_argument("--gitlab-update-source-truth", dest="gitlab_update_source_truth",
+                   action="store_true", default=None,
+                   help="Update source_of_truth files in the GitLab repo from current device state")
+    p.add_argument("--no-gitlab-update-source-truth", dest="gitlab_update_source_truth",
+                   action="store_false",
+                   help="Do not update source_of_truth files")
     p.add_argument("-v", "--verbose", action="store_true", default=False,
                    help="Enable debug logging")
     return p
-
-
-# ── Validation helpers ─────────────────────────────────────────────────────────
-
-def _validate_xml(path: str) -> None:
-    """Abort with a clear message if the file is not valid XML."""
-    try:
-        ET.parse(path)
-    except ET.ParseError as exc:
-        sys.exit(f"ERROR: Baseline policy '{path}' is not valid XML: {exc}")
-
-
-def _load_json_baseline(path: str) -> Optional[dict]:
-    """
-    Load and return a JSON baseline file.
-
-    Returns the parsed dict on success, or None (with an error printed to
-    stderr) if the file cannot be read or is not valid JSON.
-    """
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except json.JSONDecodeError as exc:
-        print(f"ERROR: Baseline file '{path}' is not valid JSON: {exc}", file=sys.stderr)
-        return None
-    except OSError as exc:
-        print(f"ERROR: Cannot read baseline file '{path}': {exc}", file=sys.stderr)
-        return None
 
 
 def _inspector_to_target_dict(inspection: Dict) -> Dict:
@@ -367,9 +341,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    # Audit mode: waf (default) or bot
-    audit_mode: str = args.audit_mode or "waf"
-
     # Load config file
     config_path = args.config or "config.yaml"
     raw_cfg = _load_config(config_path)
@@ -378,43 +349,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     gitlab_cfg = raw_cfg.get("gitlab", {})
 
     # Resolve parameters
-    host     = _resolve(args.host,     "BIGIP_HOST", bigip_cfg.get("host"))
-    username = _resolve(args.username, "BIGIP_USER", bigip_cfg.get("username"))
-    # Password must come from the environment or an interactive prompt.
-    # Accepting it from the config file would encourage storing plaintext
-    # credentials on disk.  BIGIP_PASS env var is still permitted (e.g. CI).
-    if bigip_cfg.get("password"):
-        print(
-            "ERROR: 'password' in the config file is not supported. "
-            "Use the BIGIP_PASS environment variable or the interactive prompt.",
-            file=sys.stderr,
-        )
-        return 2
-    password = os.environ.get("BIGIP_PASS")
+    host         = _resolve(args.host,     "BIGIP_HOST", bigip_cfg.get("host"))
+    username     = _resolve(args.username, "BIGIP_USER", bigip_cfg.get("username"))
     login_provider = _resolve(
         args.login_provider, "BIGIP_LOGIN_PROVIDER",
         bigip_cfg.get("login_provider"), "tmos"
     )
-    baseline = _resolve(args.baseline, "BASELINE_POLICY", audit_cfg.get("baseline_policy"))
-    output_dir = _resolve(args.output_dir, "OUTPUT_DIR",
-                          audit_cfg.get("output_dir"), _DEFAULT_OUTPUT_DIR)
+    output_dir   = _resolve(args.output_dir, "OUTPUT_DIR",
+                            audit_cfg.get("output_dir"), _DEFAULT_OUTPUT_DIR)
     report_format = _resolve(args.report_format, "REPORT_FORMAT",
                              audit_cfg.get("report_format"), "both")
 
-    # SSL verification defaults to False; This alleviates issues when the BIG-IPs use self-signed certificates
+    # SSL verification — default False for self-signed lab certs.
+    # Fix: string "true"/"1"/"yes" must map to True (was inverted in prior version).
     _raw_ssl = _resolve(args.verify_ssl, "VERIFY_SSL", bigip_cfg.get("verify_ssl"), False)
     if isinstance(_raw_ssl, str):
-        verify_ssl = _raw_ssl.lower() in ("0", "false", "no")
+        verify_ssl = _raw_ssl.lower() in ("1", "true", "yes")
     else:
         verify_ssl = bool(_raw_ssl)
-    concurrent = _resolve(args.concurrent_exports, "CONCURRENT_EXPORTS",
-                          audit_cfg.get("concurrent_exports"), 3)
-    partitions_str = _resolve(args.partitions, "PARTITIONS",
-                              None, "")
-    if partitions_str:
-        partitions = [p.strip() for p in partitions_str.split(',') if p.strip()]
-    else:
-        partitions = audit_cfg.get("partitions") or []
 
     verbose = args.verbose
 
@@ -437,33 +389,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # GitLab-backed policy state settings
     gitlab_repo_url = _resolve(
-        args.gitlab_repo_url,
-        "GITLAB_REPO_URL",
-        gitlab_cfg.get("repo_url"),
+        args.gitlab_repo_url, "GITLAB_REPO_URL", gitlab_cfg.get("repo_url"),
     )
     gitlab_local_dir = _resolve(
-        args.gitlab_local_dir,
-        "GITLAB_LOCAL_DIR",
-        gitlab_cfg.get("local_dir"),
-        _DEFAULT_GITLAB_LOCAL_DIR,
+        args.gitlab_local_dir, "GITLAB_LOCAL_DIR",
+        gitlab_cfg.get("local_dir"), _DEFAULT_GITLAB_LOCAL_DIR,
     )
     gitlab_branch = _resolve(
-        args.gitlab_branch,
-        "GITLAB_BRANCH",
-        gitlab_cfg.get("branch"),
-        "main",
+        args.gitlab_branch, "GITLAB_BRANCH", gitlab_cfg.get("branch"), "main",
     )
     _raw_gitlab_auto_push = _resolve(
-        args.gitlab_auto_push,
-        "GITLAB_AUTO_PUSH",
-        gitlab_cfg.get("auto_push"),
-        False,
+        args.gitlab_auto_push, "GITLAB_AUTO_PUSH", gitlab_cfg.get("auto_push"), False,
     )
     _raw_gitlab_update_sot = _resolve(
-        args.gitlab_update_source_truth,
-        "GITLAB_UPDATE_SOURCE_TRUTH",
-        gitlab_cfg.get("update_source_truth"),
-        False,
+        args.gitlab_update_source_truth, "GITLAB_UPDATE_SOURCE_TRUTH",
+        gitlab_cfg.get("update_source_truth"), False,
     )
     if isinstance(_raw_gitlab_auto_push, str):
         gitlab_auto_push = _raw_gitlab_auto_push.lower() in ("1", "true", "yes")
@@ -474,87 +414,73 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         gitlab_update_source_truth = bool(_raw_gitlab_update_sot)
 
-    # Setup logging first
+    # Setup logging
     ensure_dir(output_dir)
-    log = setup_logging(verbose, output_dir, audit_mode)
+    log = setup_logging(verbose, output_dir, "waf")
     logger = get_logger("main")
 
-    # Validate required arguments (--baseline not required for --INSPECT)
+    # Validate required connection arguments
     missing = []
     if not host:
         missing.append("--host / BIGIP_HOST")
     if not username:
         missing.append("--username / BIGIP_USER")
-    if audit_mode != "inspect" and not baseline:
-        missing.append("--baseline")
     if missing:
         parser.print_usage()
         print(f"\nERROR: Missing required arguments: {', '.join(missing)}")
         return 2
 
-    logger.info("Audit mode: %s", audit_mode.upper())
-
-    # Optional GitLab state manager
-    gitlab_state: Optional[GitLabStateManager] = None
-    if gitlab_repo_url:
-        gitlab_state = GitLabStateManager(
-            repo_url=gitlab_repo_url,
-            local_dir=str(Path(gitlab_local_dir).resolve()),
-            branch=gitlab_branch,
-            auto_push=gitlab_auto_push,
-        )
-        synced = gitlab_state.sync_from_remote()
-        if synced:
-            logger.info(
-                "GitLab policy state enabled (branch=%s, local_dir=%s)",
-                gitlab_branch,
-                Path(gitlab_local_dir).resolve(),
-            )
-        else:
-            logger.warning("GitLab policy state repo unavailable; continuing without source-of-truth sync.")
-            gitlab_state = None
-
-    # Validate concurrent_exports range
-    try:
-        concurrent = int(concurrent)
-    except (TypeError, ValueError):
-        print("ERROR: --concurrent-exports must be an integer between 1 and 20.")
-        return 2
-    if not 1 <= concurrent <= 20:
-        print(f"ERROR: --concurrent-exports must be between 1 and 20 (got {concurrent}).")
-        return 2
-
-    # Password prompt if needed
-    if not password:
+    # ── Determine audit mode ───────────────────────────────────────────────────
+    _mode_raw = _resolve(args.mode, "AUDIT_MODE", audit_cfg.get("mode"))
+    if _mode_raw:
+        audit_mode = str(_mode_raw).lower()
+    elif sys.stdin.isatty():
         try:
-            print(f"Please provide the password for device: {host}.")
-            password = getpass.getpass(f"Password for user '{username}': ")
-        except (KeyboardInterrupt, EOFError):
+            audit_mode = prompt_mode().lower()
+        except KeyboardInterrupt:
             print("\nAborted.")
+            return 130
+    else:
+        print(
+            "ERROR: --mode is required in non-interactive mode. "
+            "Use --mode WAF, --mode BOT, or --mode INSPECT.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Re-setup logging with correct mode prefix
+    log = setup_logging(verbose, output_dir, audit_mode)
+    logger = get_logger("main")
+
+    # ── Resolve password ───────────────────────────────────────────────────────
+    if bigip_cfg.get("password"):
+        print(
+            "ERROR: 'password' in the config file is not supported. "
+            "Use the BIGIP_PASS environment variable or the interactive prompt.",
+            file=sys.stderr,
+        )
+        return 2
+
+    password = args.password or os.environ.get("BIGIP_PASS")
+    if not password:
+        if sys.stdin.isatty():
+            try:
+                password = prompt_password(username, host)
+            except KeyboardInterrupt:
+                print("\nAborted.")
+                return 130
+        else:
+            print(
+                "ERROR: No password provided. Set BIGIP_PASS env var or use --password.",
+                file=sys.stderr,
+            )
             return 2
 
-    # Validate baseline
-    baseline = str(Path(baseline).resolve())
-    if not Path(baseline).exists():
-        logger.error("Baseline file not found: %s", baseline)
-        return 2
-
-    if audit_mode == "bot":
-        logger.info("Validating baseline JSON …")
-        baseline_data = _load_json_baseline(baseline)
-        if baseline_data is None:
-            return 1
-        baseline_name = Path(baseline).name
-    else:
-        logger.info("Validating baseline XML …")
-        _validate_xml(baseline)
-
-    # SSL warning — loud enough to be noticed when the user opts out of verification
+    # SSL warning
     if not verify_ssl:
         logger.warning(
-            "SSL verification is DISABLED (--no-verify-ssl). "
-            "Only use this for self-signed certificates in trusted environments. "
-            "Remove --no-verify-ssl and supply a valid CA bundle in production."
+            "SSL verification is DISABLED. "
+            "Only use this for self-signed certificates in trusted environments."
         )
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -583,13 +509,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception as exc:
         logger.error("Cannot connect to BIG-IP: %s", exc)
         return 2
+
+    # Print connection banner
+    version_str = get_device_version(client)
+    print(f"Connected to BIG-IP {host}  ({version_str})")
     logger.info("Authenticated successfully.")
 
-    # ── Fetch device identity ─────────────────────────────────────────────────
-    exporter = PolicyExporter(
-        client=client,
-        partitions=partitions if partitions else None,
-    )
+    # ── GitLab state manager ───────────────────────────────────────────────────
+    gitlab_state: Optional[GitLabStateManager] = None
+    if gitlab_repo_url:
+        gitlab_state = GitLabStateManager(
+            repo_url=gitlab_repo_url,
+            local_dir=str(Path(gitlab_local_dir).resolve()),
+            branch=gitlab_branch,
+            auto_push=gitlab_auto_push,
+        )
+        synced = gitlab_state.sync_from_remote()
+        if synced:
+            logger.info("GitLab policy state enabled (branch=%s)", gitlab_branch)
+        else:
+            logger.warning("GitLab policy state repo unavailable; continuing without it.")
+            gitlab_state = None
+
+    # ── Fetch device identity ──────────────────────────────────────────────────
+    exporter = PolicyExporter(client=client)
     device_info = exporter.fetch_device_info()
     device_hostname = device_info["hostname"]
     device_mgmt_ip  = device_info["mgmt_ip"]
@@ -598,7 +541,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         device_hostname or "(unknown)", device_mgmt_ip,
     )
 
-    # ── Discover partitions ───────────────────────────────────────────────────
+    # ── Discover partitions ────────────────────────────────────────────────────
     try:
         all_partitions = exporter.discover_partitions()
     except Exception as exc:
@@ -606,52 +549,59 @@ def main(argv: Optional[List[str]] = None) -> int:
         client.close()
         return 2
 
-    # ── Branch: inspect / WAF audit / Bot Defense audit ──────────────────────
-    if audit_mode == "inspect":
-        return _run_inspect_audit(
-            client=client,
-            exporter=exporter,
-            all_partitions=all_partitions,
-            output_dir=output_dir,
-            concurrent=concurrent,
-            device_hostname=device_hostname,
-            device_mgmt_ip=device_mgmt_ip,
-            logger=logger,
-        )
-    elif audit_mode == "bot":
-        return _run_bot_audit(
-            client=client,
-            all_partitions=all_partitions,
-            baseline_data=baseline_data,
-            baseline_name=baseline_name,
-            output_dir=output_dir,
-            formats=formats,
-            partitions=partitions,
-            device_hostname=device_hostname,
-            device_mgmt_ip=device_mgmt_ip,
-            gitlab_state=gitlab_state,
-            gitlab_update_source_truth=gitlab_update_source_truth,
-            logger=logger,
-            fail_on_tier=fail_on_tier,
-            pass_threshold=pass_threshold,
-        )
-    else:
-        return _run_waf_audit(
-            client=client,
-            exporter=exporter,
-            all_partitions=all_partitions,
-            baseline=baseline,
-            output_dir=output_dir,
-            formats=formats,
-            device_hostname=device_hostname,
-            device_mgmt_ip=device_mgmt_ip,
-            gitlab_state=gitlab_state,
-            gitlab_update_source_truth=gitlab_update_source_truth,
-            logger=logger,
-            fail_on_tier=fail_on_tier,
-            pass_threshold=pass_threshold,
-            concurrent=concurrent,
-        )
+    # ── Resolve --baseline-policy ──────────────────────────────────────────────
+    baseline_policy_arg = _resolve(
+        args.baseline_policy, "BASELINE_POLICY", audit_cfg.get("baseline_policy")
+    )
+
+    # ── Dispatch ───────────────────────────────────────────────────────────────
+    try:
+        if audit_mode == "inspect":
+            return _run_inspect_audit(
+                client=client,
+                exporter=exporter,
+                all_partitions=all_partitions,
+                output_dir=output_dir,
+                concurrent=5,
+                device_hostname=device_hostname,
+                device_mgmt_ip=device_mgmt_ip,
+                logger=logger,
+            )
+        elif audit_mode == "bot":
+            return _run_bot_audit(
+                client=client,
+                exporter=exporter,
+                all_partitions=all_partitions,
+                baseline_policy_arg=baseline_policy_arg,
+                output_dir=output_dir,
+                formats=formats,
+                device_hostname=device_hostname,
+                device_mgmt_ip=device_mgmt_ip,
+                gitlab_state=gitlab_state,
+                gitlab_update_source_truth=gitlab_update_source_truth,
+                logger=logger,
+                fail_on_tier=fail_on_tier,
+                pass_threshold=pass_threshold,
+            )
+        else:  # waf
+            return _run_waf_audit(
+                client=client,
+                exporter=exporter,
+                all_partitions=all_partitions,
+                baseline_policy_arg=baseline_policy_arg,
+                output_dir=output_dir,
+                formats=formats,
+                device_hostname=device_hostname,
+                device_mgmt_ip=device_mgmt_ip,
+                gitlab_state=gitlab_state,
+                gitlab_update_source_truth=gitlab_update_source_truth,
+                logger=logger,
+                fail_on_tier=fail_on_tier,
+                pass_threshold=pass_threshold,
+            )
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        return 130
 
 
 # ── Inspect workflow ───────────────────────────────────────────────────────────
@@ -703,47 +653,44 @@ def _run_inspect_audit(
 # ── WAF audit workflow ─────────────────────────────────────────────────────────
 
 def _run_waf_audit(
-    client, exporter, all_partitions, baseline, output_dir, formats,
-    device_hostname, device_mgmt_ip, gitlab_state, gitlab_update_source_truth, logger,
+    client,
+    exporter,
+    all_partitions,
+    baseline_policy_arg: Optional[str],
+    output_dir,
+    formats,
+    device_hostname,
+    device_mgmt_ip,
+    gitlab_state,
+    gitlab_update_source_truth,
+    logger,
     fail_on_tier: str,
     pass_threshold: float,
-    concurrent: int = 3,
 ) -> int:
-    """Run the ASM/AWAF policy audit using targeted REST inspection.
-
-    Policy state is collected via iControl REST API calls (enforcement mode,
-    violations, signature sets, learning mode, audit log) rather than a full
-    policy export/download.  This eliminates the async export task, polling
-    loop, and chunked file download that were previously required.
-    """
-    virtual_server_inventory = []
+    """Run the ASM/AWAF policy audit (Phase 1: PolicyInspector for both baseline and targets)."""
+    virtual_server_inventory: list = []
     virtual_server_inventory_error: Optional[str] = None
 
+    # ── Discover all policies (with VS binding refs) ───────────────────────────
     try:
-        policies = exporter.discover_policies(all_partitions)
+        all_policies = exporter.discover_policies(all_partitions)
     except ExportError as exc:
         logger.error("Policy discovery failed: %s", exc)
         client.close()
         return 2
 
-    if not policies:
+    if not all_policies:
         logger.warning("No ASM/AWAF policies found. Exiting.")
         client.close()
         return 0
 
-    exporter.print_discovery_table(policies)
-
-    # Enrich with virtual server bindings (uses VS refs already in policy dicts
-    # from discover_policies — no additional API call to /asm/policies).
-    exporter.enrich_with_virtual_servers(policies)
+    # Enrich all policies with virtual server bindings before interactive selection.
+    exporter.enrich_with_virtual_servers(all_policies)
 
     # Collect VS inventory, reusing the ASM policies payload already fetched by
     # discover_policies to avoid a duplicate /mgmt/tm/asm/policies request.
     try:
-        logger.info(
-            "Collecting virtual server inventory across %d partition(s)...",
-            len(all_partitions),
-        )
+        logger.info("Collecting virtual server inventory …")
         virtual_server_inventory = collect_virtual_server_inventory(
             bigip_client=client,
             partitions=all_partitions,
@@ -751,34 +698,53 @@ def _run_waf_audit(
         )
     except Exception as exc:
         virtual_server_inventory_error = str(exc)
-        logger.error(
-            "Virtual server inventory collection failed; continuing with policy audit: %s",
-            exc,
-        )
+        logger.error("Virtual server inventory collection failed; continuing: %s", exc)
 
-    # Inspect all policies via targeted REST calls (no export task or download).
-    inspector = PolicyInspector(client=client, concurrent=concurrent, audit_limit=10)
-    logger.info("Inspecting %d policies via REST …", len(policies))
-    inspections = inspector.inspect_all(policies)
+    # ── Interactive or non-interactive policy selection ────────────────────────
+    try:
+        run_params = collect_run_parameters(
+            all_items=all_policies,
+            output_dir=output_dir,
+            mode="WAF",
+            baseline_policy=baseline_policy_arg,
+        )
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        client.close()
+        return 1
+
+    baseline_policy = run_params["baseline"]
+    target_policies = run_params["target_policies"]
+    baseline_name   = baseline_policy.get("fullPath", "baseline")
+
+    if not target_policies:
+        logger.warning("No target policies selected. Exiting.")
+        client.close()
+        return 0
+
+    exporter.print_discovery_table(target_policies)
+
+    # ── Inspect baseline policy ────────────────────────────────────────────────
+    inspector = PolicyInspector(client=client, concurrent=5, audit_limit=10)
+    logger.info("Inspecting baseline policy: %s", baseline_name)
+    baseline_inspection = inspector.inspect_one(baseline_policy)
+    if baseline_inspection.get("errors"):
+        logger.error("Baseline inspection errors: %s", baseline_inspection["errors"])
+        client.close()
+        return 1
+    baseline_data = _inspector_to_target_dict(baseline_inspection)
+
+    # ── Inspect all target policies ────────────────────────────────────────────
+    logger.info("Inspecting %d target policies via REST …", len(target_policies))
+    inspections   = inspector.inspect_all(target_policies)
     inspection_map = {r["fullPath"]: r for r in inspections}
 
-    # Parse baseline XML — still used for comparison; only sections the inspector
-    # can reach are compared to avoid false-positive diffs.
-    logger.info("Parsing baseline policy: %s", baseline)
-    try:
-        raw_baseline = parse_policy(baseline)
-    except Exception as exc:
-        logger.error("Failed to parse baseline policy: %s", exc)
-        return 2
-    baseline_name = Path(baseline).name
-    reduced_baseline = _reduce_baseline_for_inspector(raw_baseline)
+    # ── Compare and report ─────────────────────────────────────────────────────
+    all_results: list = []
+    sot_results: list = []
+    total = len(target_policies)
 
-    # Compare and report
-    all_results = []
-    sot_results = []
-    total = len(policies)
-
-    for idx, policy in enumerate(policies, 1):
+    for idx, policy in enumerate(target_policies, 1):
         full_path = policy["fullPath"]
         inspection = inspection_map.get(full_path)
         if not inspection:
@@ -786,9 +752,7 @@ def _run_waf_audit(
             continue
 
         if inspection.get("errors"):
-            logger.warning(
-                "Inspection errors for %s: %s", full_path, inspection["errors"]
-            )
+            logger.warning("Inspection errors for %s: %s", full_path, inspection["errors"])
 
         logger.info("Auditing policy %d/%d: %s", idx, total, full_path)
 
@@ -800,7 +764,7 @@ def _run_waf_audit(
         }
 
         cmp_result = compare_policies(
-            baseline=reduced_baseline,
+            baseline=baseline_data,
             target=target_data,
             policy_meta=meta,
             baseline_name=baseline_name,
@@ -833,15 +797,10 @@ def _run_waf_audit(
                     )
                     sot_results.append(sot_cmp_result)
                 except Exception as exc:
-                    logger.warning(
-                        "Source-of-truth comparison failed for %s: %s",
-                        full_path,
-                        exc,
-                    )
+                    logger.warning("SoT comparison failed for %s: %s", full_path, exc)
 
         if "markdown" in formats:
             generate_markdown(cmp_result, output_dir)
-        # HTML is generated once as an interactive multi-policy dashboard.
 
     if all_results:
         if "html" in formats:
@@ -851,7 +810,6 @@ def _run_waf_audit(
                 virtual_server_inventory=virtual_server_inventory,
                 virtual_server_inventory_error=virtual_server_inventory_error,
             )
-
         summary_formats = [f for f in formats if f != "html"]
         if summary_formats:
             generate_summary_reports(all_results, output_dir, summary_formats)
@@ -869,8 +827,7 @@ def _run_waf_audit(
                 generate_markdown(r, sot_output_dir)
         if "html" in formats:
             generate_html_dashboard(
-                sot_results,
-                sot_output_dir,
+                sot_results, sot_output_dir,
                 virtual_server_inventory=virtual_server_inventory,
                 virtual_server_inventory_error=virtual_server_inventory_error,
             )
@@ -883,17 +840,12 @@ def _run_waf_audit(
                 output_dir=sot_output_dir,
                 inventory_error=virtual_server_inventory_error,
             )
-        logger.info(
-            "Generated %d source-of-truth comparison report(s) under %s",
-            len(sot_results),
-            Path(output_dir) / "source_of_truth" / "reports",
-        )
 
     if gitlab_state is not None:
         gitlab_state.archive_run(
             mode="waf",
             output_dir=output_dir,
-            baseline_path=baseline,
+            baseline_path=baseline_name,
             device_hostname=device_hostname,
             device_mgmt_ip=device_mgmt_ip,
             audited_count=len(all_results),
@@ -923,41 +875,79 @@ def _run_waf_audit(
 # ── Bot Defense audit workflow ─────────────────────────────────────────────────
 
 def _run_bot_audit(
-    client, all_partitions, baseline_data, baseline_name, output_dir, formats,
-    partitions, device_hostname, device_mgmt_ip, gitlab_state,
-    gitlab_update_source_truth, logger,
+    client,
+    exporter,
+    all_partitions,
+    baseline_policy_arg: Optional[str],
+    output_dir,
+    formats,
+    device_hostname,
+    device_mgmt_ip,
+    gitlab_state,
+    gitlab_update_source_truth,
+    logger,
     fail_on_tier: str,
     pass_threshold: float,
 ) -> int:
-    """Run the Bot Defense profile audit."""
+    """Run the Bot Defense profile audit (Phase 1: baseline selected from BIG-IP)."""
     auditor = BotDefenseAuditor(
         client=client,
         output_dir=output_dir,
-        partitions=partitions if partitions else None,
+        partitions=None,
     )
 
+    # ── Discover all profiles ──────────────────────────────────────────────────
     try:
-        profiles = auditor.discover_profiles(all_partitions)
+        all_profiles = auditor.discover_profiles(all_partitions)
     except RuntimeError as exc:
         logger.error("Bot Defense profile discovery failed: %s", exc)
         client.close()
         return 2
 
-    if not profiles:
+    if not all_profiles:
         logger.warning("No Bot Defense profiles found. Exiting.")
         client.close()
         return 0
 
-    auditor.print_discovery_table(profiles)
+    auditor.enrich_with_virtual_servers(all_profiles)
 
-    # Enrich profiles with Virtual Server bindings (direct and via LTM policy)
-    auditor.enrich_with_virtual_servers(profiles)
-
-    successes, failures = auditor.fetch_all(profiles)
-    if failures:
-        logger.warning(
-            "%d Bot Defense profile fetch(es) failed:", len(failures)
+    # ── Interactive or non-interactive selection ───────────────────────────────
+    try:
+        run_params = collect_run_parameters(
+            all_items=all_profiles,
+            output_dir=output_dir,
+            mode="BOT",
+            baseline_policy=baseline_policy_arg,
         )
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        client.close()
+        return 1
+
+    baseline_profile = run_params["baseline"]
+    target_profiles  = run_params["target_policies"]
+    baseline_name    = baseline_profile.get("fullPath", "baseline")
+
+    if not target_profiles:
+        logger.warning("No target profiles selected. Exiting.")
+        client.close()
+        return 0
+
+    auditor.print_discovery_table(target_profiles)
+
+    # ── Fetch baseline profile data ────────────────────────────────────────────
+    logger.info("Fetching baseline Bot Defense profile: %s", baseline_name)
+    try:
+        baseline_data = auditor.fetch_profile(baseline_profile)
+    except Exception as exc:
+        logger.error("Failed to fetch baseline profile %s: %s", baseline_name, exc)
+        client.close()
+        return 1
+
+    # ── Fetch target profiles ──────────────────────────────────────────────────
+    successes, failures = auditor.fetch_all(target_profiles)
+    if failures:
+        logger.warning("%d Bot Defense profile fetch(es) failed:", len(failures))
         for profile, err in failures:
             logger.warning("  %s: %s", profile["fullPath"], err)
 
@@ -968,11 +958,10 @@ def _run_bot_audit(
 
     client.close()
 
-    # Compare and report
-    all_results = []
-    sot_results = []
+    # ── Compare and report ─────────────────────────────────────────────────────
+    all_results: list = []
+    sot_results: list = []
     total = len(successes)
-    iterable = successes
 
     for idx, (profile_meta, profile_data) in enumerate(successes, 1):
         logger.info(
@@ -1016,19 +1005,16 @@ def _run_bot_audit(
                     sot_results.append(sot_cmp_result)
                 except Exception as exc:
                     logger.warning(
-                        "Source-of-truth comparison failed for %s: %s",
-                        profile_meta["fullPath"],
-                        exc,
+                        "SoT comparison failed for %s: %s",
+                        profile_meta["fullPath"], exc,
                     )
 
         if "markdown" in formats:
             generate_markdown(cmp_result, output_dir)
-        # HTML is generated once as an interactive multi-profile dashboard.
 
     if all_results:
         if "html" in formats:
             generate_html_dashboard(all_results, output_dir)
-
         summary_formats = [f for f in formats if f != "html"]
         if summary_formats:
             generate_summary_reports(all_results, output_dir, summary_formats)
@@ -1043,11 +1029,6 @@ def _run_bot_audit(
         summary_formats = [f for f in formats if f != "html"]
         if summary_formats:
             generate_summary_reports(sot_results, sot_output_dir, summary_formats)
-        logger.info(
-            "Generated %d source-of-truth comparison report(s) under %s",
-            len(sot_results),
-            Path(output_dir) / "source_of_truth" / "reports",
-        )
 
     if gitlab_state is not None:
         gitlab_state.archive_run(
