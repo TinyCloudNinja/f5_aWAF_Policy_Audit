@@ -894,8 +894,25 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
     target_viols: List[Dict] = result.violations or []
     baseline_viols: List[Dict] = result.baseline_violations or []
 
+    # Yellow warning banner when the baseline XML appears to be a compact export.
+    # Compact exports (minimal=true) silently omit default-state violations such as
+    # VIRUS_DETECTED, making the comparison incomplete.
+    compact_banner = ""
+    if getattr(result, "baseline_compact_warning", False):
+        n = len(baseline_viols)
+        compact_banner = (
+            "<div class='inventory-banner' role='alert' style='margin-bottom:14px'>"
+            "<strong>&#9888; Warning: Baseline policy may have been exported in compact mode</strong><br>"
+            f"({n} violations parsed; expected &ge; 150). "
+            "Comparison results may be incomplete &mdash; default-state violations "
+            "(e.g., VIRUS_DETECTED) are omitted from compact exports. "
+            "Re-export the baseline with full/non-compact mode (<code>minimal=false</code>) "
+            "to ensure all violations are included."
+            "</div>"
+        )
+
     if not target_viols and not baseline_viols:
-        return "<p class='muted'>No WAF violation settings were available for comparison.</p>"
+        return compact_banner + "<p class='muted'>No WAF violation settings were available for comparison.</p>"
 
     # Robust cross-format join: F5 exports the same violations in two formats —
     # <blocking> uses id="EVASION_DETECTED" name="Human name", while
@@ -1128,7 +1145,7 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
         "</details>"
     )
 
-    return main_table + match_block + scope_block
+    return compact_banner + main_table + match_block + scope_block
 
 
 def _learning_mode_badge(mode: str) -> str:

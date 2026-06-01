@@ -245,8 +245,14 @@ class TestParseBlockingSection:
         assert "EVASION_DETECTED" in ids
 
     def test_violation_has_name(self):
+        # name = canonical machine ID (used as comparator join key)
         viol = next(v for v in self.bl_base["violations"] if v["id"] == "VIRUS_DETECTED")
-        assert viol["name"] == "Virus detected"
+        assert viol["name"] == "VIRUS_DETECTED"
+
+    def test_violation_has_description(self):
+        # description = human-readable label for display
+        viol = next(v for v in self.bl_base["violations"] if v["id"] == "VIRUS_DETECTED")
+        assert viol["description"] == "Virus detected"
 
     # ── alarm / block / learn flags ───────────────────────────────────────────
 
