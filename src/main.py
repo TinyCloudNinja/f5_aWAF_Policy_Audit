@@ -555,6 +555,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.baseline_policy, "BASELINE_POLICY", audit_cfg.get("baseline_policy")
     )
 
+    # Guard against stale config.yaml entries that still point to a local file
+    # (e.g. baseline_policy: "./baseline/corporate_baseline.xml").  Device
+    # fullPaths look like '/Common/Name' or '~Common~Name' — never have a file
+    # extension.  Silently dropping the value lets the interactive menu take over
+    # rather than producing a confusing "policy not found on device" error.
+    if baseline_policy_arg:
+        _bp_ext = Path(str(baseline_policy_arg)).suffix.lower()
+        _bp_str = str(baseline_policy_arg)
+        if _bp_ext in (".xml", ".json", ".yaml", ".yml") or _bp_str.startswith(("./", "../")):
+            logger.warning(
+                "Ignoring baseline_policy value %r — looks like a local file path, "
+                "not a device fullPath.  Use --baseline-policy with a device fullPath "
+                "(e.g. '~Common~BST_Baseline') or remove 'baseline_policy' from your "
+                "config file to use the interactive selector.",
+                baseline_policy_arg,
+            )
+            baseline_policy_arg = None
+
     # ── Dispatch ───────────────────────────────────────────────────────────────
     try:
         if audit_mode == "inspect":
