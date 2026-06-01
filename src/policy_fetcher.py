@@ -79,17 +79,31 @@ def _derive_name(item: Dict) -> str:
 
 
 def _normalize_violations(items: List[Dict]) -> List[Dict]:
-    return [
-        {
-            "name":        str(v.get("name") or "").strip(),
-            "description": str(v.get("description") or v.get("name") or ""),
+    """Normalize ASM blocking-settings/violations items.
+
+    The canonical join key is ``name`` (machine ID, e.g. VIRUS_DETECTED).
+    Some BIG-IP versions / $select projections return an empty ``name``; in
+    that case we derive a stable key from ``description`` (upper-snake-cased)
+    rather than dropping the violation — mirroring policy_inspector so that
+    default-state violations are not silently lost.  Items with neither a
+    name nor a description are skipped.
+    """
+    result: List[Dict] = []
+    for v in items:
+        name = str(v.get("name") or "").strip()
+        desc = str(v.get("description") or "").strip()
+        if not name and desc:
+            name = desc.upper().replace(" ", "_")
+        if not name:
+            continue
+        result.append({
+            "name":        name,
+            "description": desc or name,
             "alarm":       bool(v.get("alarm", False)),
             "block":       bool(v.get("block", False)),
             "learn":       bool(v.get("learn", False)),
-        }
-        for v in items
-        if v.get("name")
-    ]
+        })
+    return result
 
 
 def _normalize_bool_items(items: List[Dict]) -> List[Dict]:
@@ -314,6 +328,9 @@ class PolicyFetcher:
                 _viols_resp.get("items", [])
                 if isinstance(_viols_resp, dict)
                 else []
+            )
+            self.log.debug(
+                "Fetched %d raw violation(s) for %s", len(violations_raw), policy_id
             )
         except Exception as exc:
             self.log.warning("violations fetch failed (%s): %s", policy_id, exc)
