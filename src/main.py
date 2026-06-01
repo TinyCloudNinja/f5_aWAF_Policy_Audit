@@ -304,7 +304,11 @@ def _reduce_baseline_for_inspector(baseline_data: Dict) -> Dict:
     return {
         "general":           {"enforcementMode": baseline_data.get("general", {}).get("enforcementMode", "transparent")},
         "blocking-settings": {
-            "violations":     baseline_data.get("blocking-settings", {}).get("violations", []),
+            # Fall back to <blocking> section for XML exports that use that format
+            "violations":     (
+                baseline_data.get("blocking-settings", {}).get("violations", [])
+                or baseline_data.get("blocking", {}).get("violations", [])
+            ),
             "evasions":       [],
             "http-protocols": [],
         },
