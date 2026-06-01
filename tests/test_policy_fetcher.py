@@ -103,8 +103,17 @@ class TestNormalizeViolations:
         assert result[0]["alarm"] is True
         assert result[0]["learn"] is False
 
-    def test_items_without_name_skipped(self):
-        items = [{"description": "no name", "alarm": True, "block": False, "learn": False}]
+    def test_name_derived_from_description_when_missing(self):
+        """When 'name' is empty (some BIG-IP $select projections), derive it from
+        description rather than dropping the violation."""
+        items = [{"description": "Virus detected", "alarm": True, "block": False, "learn": False}]
+        result = _normalize_violations(items)
+        assert len(result) == 1
+        assert result[0]["name"] == "VIRUS_DETECTED"
+        assert result[0]["alarm"] is True
+
+    def test_items_without_name_or_description_skipped(self):
+        items = [{"alarm": True, "block": False, "learn": False}]
         result = _normalize_violations(items)
         assert result == []
 
