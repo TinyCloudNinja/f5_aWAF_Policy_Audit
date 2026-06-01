@@ -105,9 +105,6 @@ class BigIPClient:
             self._token_lifetime, self._token_lifetime * 0.80
         )
 
-        # Drop the password from memory — the token is used for all subsequent
-        # requests and the plaintext credential is no longer needed.
-        self._password = ""
 
     def _ensure_token(self) -> None:
         """Re-authenticate if the token is absent or approaching expiry.
@@ -276,6 +273,7 @@ class BigIPClient:
         return total_written
 
     def close(self) -> None:
+        self._password = ""
         self._session.close()
 
 
