@@ -13,6 +13,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .policy_parser import _XML_VIOL_ID_ALIASES as _VIOL_ALIASES
 from .policy_comparator import (
     ComparisonResult,
     SEVERITY_CRITICAL,
@@ -919,11 +920,23 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
     # <blocking-settings> uses only name="EVASION_DETECTED" (machine ID as name).
     # Index each side by both id and name so we match regardless of which format
     # each side came from.
+    #
+    # Additionally, F5 renamed certain violation IDs between BIG-IP versions (e.g.
+    # MALFORMED_JSON → MALFORMED_JSON_DATA).  The XML export preserves the old id=
+    # attribute while the REST API returns the new name.  _norm_vid() canonicalizes
+    # both old and new forms to the same key so the join succeeds across versions.
+    _VIOL_ALIAS_REV: Dict[str, str] = {v: k for k, v in _VIOL_ALIASES.items()}
+
+    def _norm_vid(raw: str) -> str:
+        """Return the canonical violation ID, collapsing known version renames."""
+        # Prefer the new (REST API) name as canonical; map old XML id → new name.
+        return _VIOL_ALIASES.get(raw, raw)
+
     def _vid(v: Dict) -> str:
-        return str(v.get("id") or "").strip()
+        return _norm_vid(str(v.get("id") or "").strip())
 
     def _vname(v: Dict) -> str:
-        return str(v.get("name") or "").strip()
+        return _norm_vid(str(v.get("name") or "").strip())
 
     def _canonical(v: Dict) -> str:
         return _vid(v) or _vname(v)
@@ -1036,9 +1049,18 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
     else:
         tbody.append(_none_row())
 
-    # Bucket A — active on policy, not in baseline
+    # Bucket A — active on policy, not in baseline.
+    # When the baseline is a compact export (< 150 violations), violations that
+    # are active on the target but absent from the baseline may simply be at their
+    # default/inactive state in the baseline export — not a genuine policy gap.
+    # Re-export the baseline with minimal=false to resolve this ambiguity.
+    _bucket_a_suffix = (
+        " — Baseline compact export: these may be at default state in baseline"
+        if getattr(result, "baseline_compact_warning", False)
+        else ""
+    )
     tbody.append(_bucket_hdr(
-        "Violations Active on Policy — Not in Baseline", len(bucket_a), "#e67e22"
+        f"Violations Active on Policy — Not in Baseline{_bucket_a_suffix}", len(bucket_a), "#e67e22"
     ))
     if bucket_a:
         for v in bucket_a:

@@ -150,6 +150,24 @@ def _parse_blocking_settings(root) -> Dict:
     }
 
 
+# ── Violation ID alias table ───────────────────────────────────────────────────
+#
+# F5 BIG-IP renamed several violation machine IDs between software versions.
+# The XML export format preserves the *old* id= attribute while the iControl
+# REST API (/blocking-settings/violations) returns the *new* name.  Normalizing
+# at parse time ensures that both the XML baseline and the REST-based target use
+# the same canonical ID so the comparator can join them.
+#
+# Mapping is intentionally explicit (not a blanket suffix rule) to avoid masking
+# genuine ID differences introduced by future F5 version changes.
+
+_XML_VIOL_ID_ALIASES: Dict[str, str] = {
+    "MALFORMED_JSON": "MALFORMED_JSON_DATA",
+    "MALFORMED_GWT":  "MALFORMED_GWT_DATA",
+    "MALFORMED_XML":  "MALFORMED_XML_DATA",
+}
+
+
 def _parse_blocking_violation(el) -> Dict:
     """
     Parse a <violation> element from the newer <blocking> section format.
@@ -160,8 +178,14 @@ def _parse_blocking_violation(el) -> Dict:
     both XML section formats (<blocking> with id= and <blocking-settings> with
     <name>MACHINE_ID</name>) and the live REST API all produce violation dicts
     where 'name' is the canonical join key (all-caps identifier).
+
+    Known version-specific ID renames (e.g. MALFORMED_JSON → MALFORMED_JSON_DATA)
+    are normalized via _XML_VIOL_ID_ALIASES so that an XML baseline exported on an
+    older BIG-IP version still joins correctly against a newer REST API target.
     """
-    machine_id   = el.get("id", "")
+    raw_id       = el.get("id", "")
+    # Normalize known renames so XML id aligns with the current REST API name.
+    machine_id   = _XML_VIOL_ID_ALIASES.get(raw_id, raw_id)
     display_name = el.get("name", "") or _text(el, "name")
     pb_raw = _text(el, "policy_builder_tracking") or _text(el, "policy-builder-tracking")
     return {
