@@ -318,8 +318,19 @@ def _reduce_baseline_for_inspector(baseline_data: Dict) -> Dict:
     comparator only diffs what both sides actually have, preventing false-positive
     findings for things like custom URLs, parameters, and data-guard settings.
     """
+    # Enforcement mode: prefer the <blocking> section's enforcement_mode, which is
+    # the authoritative policy mode in full exports.  Many exports carry only a
+    # placeholder <general> section that defaults to "transparent" even when the
+    # policy is blocking; preferring <blocking> (as compare_policies already does
+    # for the target) prevents a false "transparent vs blocking" drift against the
+    # live policy, whose mode comes from the REST enforcementMode field.
+    enforcement_mode = (
+        baseline_data.get("blocking", {}).get("enforcement_mode")
+        or baseline_data.get("general", {}).get("enforcementMode")
+        or "transparent"
+    )
     return {
-        "general":           {"enforcementMode": baseline_data.get("general", {}).get("enforcementMode", "transparent")},
+        "general":           {"enforcementMode": enforcement_mode},
         "blocking-settings": {
             # Fall back to <blocking> section for XML exports that use that format
             "violations":     (

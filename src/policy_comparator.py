@@ -27,6 +27,40 @@ from .utils import (
 _log = get_logger("policy_comparator")
 
 
+# ── Normalization helpers ──────────────────────────────────────────────────────
+
+
+def normalize_enforcement_mode(raw: object) -> str:
+    """Normalize enforcement mode values from mixed BIG-IP sources.
+
+    Exports and API payloads represent the enforcement mode in different places
+    and spellings (the ``<general>`` section, the ``<blocking>`` section, the REST
+    ``enforcementMode`` field) with extra whitespace, mixed case, or composite
+    labels.  Collapsing them to canonical ``blocking``/``transparent`` prevents a
+    blocking policy from being reported as drifted against a transparent baseline
+    (or vice-versa) purely because of representation differences.
+    """
+    text = str(raw or "").strip().lower()
+    if not text:
+        return "transparent"
+    if "block" in text:
+        return "blocking"
+    if "transparent" in text:
+        return "transparent"
+    return text
+
+
+def normalize_learning_mode(raw: object) -> str:
+    """Normalize a Policy Builder learning-mode value for comparison.
+
+    The XML baseline parser preserves the raw capitalized value (e.g.
+    ``Automatic``) while the REST inspector lower-cases it (``automatic``).
+    Comparing the canonical lower-case form avoids a false drift finding driven
+    solely by letter case.
+    """
+    return str(raw or "").strip().lower()
+
+
 # ── Severity and deduction model ───────────────────────────────────────────────
 
 
@@ -176,25 +210,9 @@ def compare_policies(
 
     meta = policy_meta or {}
 
-    def _normalize_enforcement_mode(raw: object) -> str:
-        """Normalize enforcement mode values from mixed BIG-IP sources.
-
-        Some exports/API payloads contain extra whitespace, mixed case, or
-        composite labels. We normalize to canonical values where possible to
-        avoid rendering a blocking policy as transparent.
-        """
-        text = str(raw or "").strip().lower()
-        if not text:
-            return "transparent"
-        if "block" in text:
-            return "blocking"
-        if "transparent" in text:
-            return "transparent"
-        return text
-
     # Prefer explicit blocking section enforcement_mode when present; fall back to
     # general.enforcementMode. Default to "transparent" only when neither is set.
-    target_enforcement_mode = _normalize_enforcement_mode(
+    target_enforcement_mode = normalize_enforcement_mode(
         target.get("blocking", {}).get("enforcement_mode")
         or target.get("general", {}).get("enforcementMode")
         or "transparent"
@@ -323,8 +341,12 @@ def _cmp_general(baseline: Dict, target: Dict, result: ComparisonResult) -> None
     b_gen = baseline.get("general", {})
     t_gen = target.get("general", {})
 
-    b_mode = b_gen.get("enforcementMode", "transparent")
-    t_mode = t_gen.get("enforcementMode", "transparent")
+    # Normalize both sides: the baseline may carry the mode in <general>, in
+    # <blocking>, or (for the REST inspector) the policy-level enforcementMode
+    # field — all with differing case/spelling.  Comparing canonical forms avoids
+    # a false drift when both policies are, e.g., blocking but spelled differently.
+    b_mode = normalize_enforcement_mode(b_gen.get("enforcementMode", "transparent"))
+    t_mode = normalize_enforcement_mode(t_gen.get("enforcementMode", "transparent"))
     if b_mode != t_mode:
         sev = Severity.CRITICAL.value if (b_mode == "blocking" and t_mode != "blocking") else Severity.WARNING.value
         _add(result, DiffItem(
@@ -842,7 +864,17 @@ def _cmp_policy_builder(baseline: Dict, target: Dict, result: ComparisonResult) 
     for key, sev, desc in flat_checks:
         b_val = b_pb.get(key)
         t_val = t_pb.get(key)
-        if b_val is not None and b_val != t_val:
+        # learningMode is spelled with different case across sources (XML baseline
+        # keeps "Automatic"; REST inspector emits "automatic").  Compare canonical
+        # lower-case forms so identical modes do not register as drift.
+        if key == "learningMode":
+            differs = (
+                b_val is not None
+                and normalize_learning_mode(b_val) != normalize_learning_mode(t_val)
+            )
+        else:
+            differs = b_val is not None and b_val != t_val
+        if differs:
             _add(result, DiffItem(
                 section="policy-builder",
                 section_category="policy_builder",

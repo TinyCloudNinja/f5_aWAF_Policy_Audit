@@ -363,3 +363,71 @@ class TestBaselineCompactWarning:
         """ComparisonResult always exposes baseline_compact_warning."""
         assert hasattr(result, "baseline_compact_warning")
         assert isinstance(result.baseline_compact_warning, bool)
+
+
+# ── False-drift regression tests (enforcement mode + learning mode) ─────────────
+
+class TestEnforcementModeNormalization:
+    """Two policies that are both blocking must not register enforcement drift,
+    even when the mode is spelled/cased differently or sourced from different
+    sections (baseline <general> default vs target REST enforcementMode field)."""
+
+    def _base(self, **over):
+        d = {
+            "general":           {"enforcementMode": "blocking"},
+            "blocking-settings": {"violations": [], "evasions": [], "http-protocols": []},
+            "blocking":          {},
+            "attack-signatures": [], "signature-sets": [], "urls": [],
+            "filetypes": [], "parameters": [], "headers": [], "cookies": [],
+            "methods": [], "http-protocols": [], "evasions": [], "data-guard": {},
+            "brute-force": [], "ip-intelligence": {}, "bot-defense": {},
+            "login-pages": [], "policy-builder": {}, "whitelist-ips": [],
+        }
+        d.update(over)
+        return d
+
+    def test_blocking_vs_blocking_no_finding(self):
+        r = compare_policies(baseline=self._base(), target=self._base())
+        assert not [d for d in r.diffs if d.section == "general" and d.attribute == "enforcementMode"]
+
+    def test_case_and_spelling_differences_ignored(self):
+        baseline = self._base(general={"enforcementMode": "Blocking "})
+        target   = self._base(general={"enforcementMode": "blocking"})
+        r = compare_policies(baseline=baseline, target=target)
+        assert not [d for d in r.diffs if d.section == "general" and d.attribute == "enforcementMode"]
+
+    def test_real_transparent_drift_still_critical(self):
+        """A genuine blocking→transparent drift must still be flagged Critical."""
+        baseline = self._base(general={"enforcementMode": "blocking"})
+        target   = self._base(general={"enforcementMode": "transparent"})
+        r = compare_policies(baseline=baseline, target=target)
+        crit = [d for d in r.diffs
+                if d.section == "general" and d.attribute == "enforcementMode"
+                and d.severity == SEVERITY_CRITICAL]
+        assert len(crit) == 1
+
+
+class TestLearningModeNormalization:
+    """Policy Builder learning mode comparison must be case-insensitive so that
+    XML baseline 'Automatic' matches REST inspector 'automatic'."""
+
+    def _base(self, learning):
+        return {
+            "general":           {"enforcementMode": "blocking"},
+            "blocking-settings": {"violations": [], "evasions": [], "http-protocols": []},
+            "blocking":          {},
+            "attack-signatures": [], "signature-sets": [], "urls": [],
+            "filetypes": [], "parameters": [], "headers": [], "cookies": [],
+            "methods": [], "http-protocols": [], "evasions": [], "data-guard": {},
+            "brute-force": [], "ip-intelligence": {}, "bot-defense": {},
+            "login-pages": [], "policy-builder": {"learningMode": learning},
+            "whitelist-ips": [],
+        }
+
+    def test_case_difference_no_finding(self):
+        r = compare_policies(baseline=self._base("Automatic"), target=self._base("automatic"))
+        assert not [d for d in r.diffs if d.attribute == "learningMode"]
+
+    def test_real_learning_mode_drift_still_flagged(self):
+        r = compare_policies(baseline=self._base("Automatic"), target=self._base("disabled"))
+        assert [d for d in r.diffs if d.attribute == "learningMode"]
