@@ -354,6 +354,39 @@ class TestFetchViolations:
         names = {v["name"] for v in result["learn"]}
         assert "VIRUS_DETECTED" in names
 
+    def test_all_key_present(self):
+        """Result must always include an 'all' key."""
+        inspector = self._inspector()
+        result, errors = inspector._fetch_violations("abc123")
+        assert "all" in result
+
+    def test_all_key_includes_all_violations(self):
+        """Every violation (including all-False ones) must appear in 'all'."""
+        inspector = self._inspector()
+        result, errors = inspector._fetch_violations("abc123")
+        all_names = {v["name"] for v in result["all"]}
+        assert "VIOL_ATTACK_SIGNATURE" in all_names
+        assert "VIOL_COOKIE_NOT_BASE64" in all_names
+        assert "VIOL_FILETYPE" in all_names
+        # VIOL_PARAMETER_VALUE has alarm=False, block=False, learn=False
+        assert "VIOL_PARAMETER_VALUE" in all_names
+
+    def test_all_key_has_correct_flag_values(self):
+        """Flag values in 'all' entries must reflect the actual API response."""
+        inspector = self._inspector()
+        result, errors = inspector._fetch_violations("abc123")
+        all_by_name = {v["name"]: v for v in result["all"]}
+
+        sig = all_by_name["VIOL_ATTACK_SIGNATURE"]
+        assert sig["learn"] is True
+        assert sig["alarm"] is True
+        assert sig["block"] is True
+
+        param = all_by_name["VIOL_PARAMETER_VALUE"]
+        assert param["learn"] is False
+        assert param["alarm"] is False
+        assert param["block"] is False
+
 
 # ---------------------------------------------------------------------------
 # PolicyInspector._fetch_signature_sets
