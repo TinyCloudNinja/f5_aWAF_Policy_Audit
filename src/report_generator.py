@@ -310,10 +310,21 @@ def generate_html_dashboard(
     summary_content = (
         "<section id='summary-view' class='view active' role='region' aria-label='Summary'>"
         + (
-            _build_virtual_server_summary_section(
-                virtual_server_inventory=virtual_server_inventory or [],
-                inventory_error=virtual_server_inventory_error,
-                policy_path_to_id=policy_path_to_id,
+            (
+                f"{summary_bar}"
+                "<h2 class='sec-h2'>Policy Compliance Summary</h2>"
+                "<table class='results'>"
+                "<thead><tr>"
+                "<th>Policy Name</th><th>Tier</th><th>Score (%)</th><th>Raw Score</th><th>Circuit Breakers</th>"
+                "<th>Critical</th><th>High</th><th>Warning</th><th>Info</th>"
+                "</tr></thead><tbody>"
+                + "".join(rows)
+                + "</tbody></table>"
+                + _build_virtual_server_summary_section(
+                    virtual_server_inventory=virtual_server_inventory or [],
+                    inventory_error=virtual_server_inventory_error,
+                    policy_path_to_id=policy_path_to_id,
+                )
             )
             if not is_bot
             else (

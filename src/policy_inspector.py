@@ -69,7 +69,7 @@ class PolicyInspector:
         result["signatureSets"] = sig_sets
         result["errors"].extend(errs)
 
-        audit, errs = self._fetch_audit(name)
+        audit, errs = self._fetch_audit(policy_id)
         result["auditLog"] = audit
         result["errors"].extend(errs)
 
@@ -202,68 +202,19 @@ class PolicyInspector:
 
         return sets, []
 
-    def _fetch_audit(self, policy_name: str) -> Tuple[List, List[str]]:
-        """GET audit-log entries for the policy, newest-first.
-
-        Tries the server-side $filter first; falls back to client-side
-        filtering on older BIG-IP versions that reject the $filter syntax.
-        """
-        items, error = self._audit_with_filter(policy_name)
-
-        if error is not None:
-            # Primary call failed — try the fallback
-            self.log.debug(
-                "Audit $filter rejected for '%s' (%s), falling back to client-side filter",
-                policy_name, error,
-            )
-            items, fallback_error = self._audit_fallback(policy_name)
-            if fallback_error is not None:
-                return [], [f"audit: {fallback_error}"]
-
-        return [_format_audit_entry(i) for i in items], []
-
-    # ── Audit sub-helpers ──────────────────────────────────────────────────────
-
-    def _audit_with_filter(
-        self, policy_name: str
-    ) -> Tuple[List, object]:
-        """Return (items, None) on success or ([], error_string) on failure."""
+    def _fetch_audit(self, policy_id: str) -> Tuple[List, List[str]]:
+        """GET audit-log entries via the per-policy audit-logs endpoint."""
+        if not policy_id:
+            return [], ["audit: no policy_id available"]
         try:
             data = self.client.get(
-                "/mgmt/tm/asm/audit",
-                params={
-                    "$filter":  f"entityName eq '{policy_name}'",
-                    "$orderby": "lastUpdateMicros desc",
-                    "$top":     str(self.audit_limit),
-                    "$select":  "action,username,lastUpdateMicros,entityName,entityType",
-                },
+                f"/mgmt/tm/asm/policies/{policy_id}/audit-logs",
+                params={"$top": str(self.audit_limit)},
             )
-            return data.get("items", [])[: self.audit_limit], None
+            items = data.get("items", [])[: self.audit_limit]
+            return [_format_audit_entry(i) for i in items], []
         except Exception as exc:
-            return [], str(exc)
-
-    def _audit_fallback(
-        self, policy_name: str
-    ) -> Tuple[List, object]:
-        """Client-side filter: fetch top-100, keep matching policy entries."""
-        try:
-            data = self.client.get(
-                "/mgmt/tm/asm/audit",
-                params={
-                    "$orderby": "lastUpdateMicros desc",
-                    "$top":     "100",
-                    "$select":  "action,username,lastUpdateMicros,entityName,entityType",
-                },
-            )
-        except Exception as exc:
-            return [], str(exc)
-
-        filtered = [
-            i for i in data.get("items", [])
-            if i.get("entityName") == policy_name
-            and i.get("entityType", "").lower() in ("security", "policy", "security_policy")
-        ]
-        return filtered[: self.audit_limit], None
+            return [], [f"audit: {exc}"]
 
 
 # ── Module-level helpers ───────────────────────────────────────────────────────
@@ -283,13 +234,17 @@ def _normalize_learning_mode(raw: str) -> str:
 
 def _format_audit_entry(item: Dict) -> Dict:
     """Convert a raw audit item to the output schema shape."""
-    micros = item.get("lastUpdateMicros", 0)
-    try:
-        ts = datetime.utcfromtimestamp(int(micros) / 1_000_000).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-    except (ValueError, TypeError, OSError):
-        ts = ""
+    ts = ""
+    micros = item.get("lastUpdateMicros")
+    if micros is not None:
+        try:
+            ts = datetime.utcfromtimestamp(int(micros) / 1_000_000).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        except (ValueError, TypeError, OSError):
+            ts = ""
+    if not ts:
+        ts = str(item.get("dateTime") or item.get("date") or "")
     return {
         "action":    item.get("action", ""),
         "username":  item.get("username", ""),

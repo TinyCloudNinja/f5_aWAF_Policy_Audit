@@ -122,10 +122,6 @@ def _extract_direct_waf_reference_candidates(vs_item: Dict[str, Any]) -> List[An
         if key in vs_item:
             candidates.append(vs_item.get(key))
 
-    sec_profiles = vs_item.get("securityLogProfiles") or vs_item.get("securityLogProfilesReference")
-    if sec_profiles:
-        candidates.append(sec_profiles)
-
     return candidates
 
 
