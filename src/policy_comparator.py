@@ -160,11 +160,6 @@ class ComparisonResult:
     asm_audit_log_total: int = 0
     # Non-None when the audit log fetch failed
     asm_audit_log_error: Optional[str] = None
-    # True when the baseline XML appears to have been exported in compact/minimal
-    # mode — fewer than _MINIMUM_EXPECTED_VIOLATIONS violations were found.
-    # Compact exports silently omit default-state violations (e.g. VIRUS_DETECTED),
-    # making the comparison incomplete.  Triggers a warning banner in the report.
-    baseline_compact_warning: bool = False
     # Tiered scoring metadata
     tier: str = TIER_GREEN
     tier_label: str = "Compliant"
@@ -302,21 +297,6 @@ def compare_policies(
 
     baseline_blocking_violations = baseline.get("blocking", {}).get("violations", [])
     result.baseline_violations = baseline_blocking_violations or baseline.get("blocking-settings", {}).get("violations", [])
-
-    # Compact-export detection: if the baseline has suspiciously few violations,
-    # it was likely exported with minimal=true which silently omits default-state
-    # violations (e.g. VIRUS_DETECTED).  ~180-220 violations exist in a full export.
-    _MINIMUM_EXPECTED_VIOLATIONS = 150
-    _bl_viol_count = len(result.baseline_violations)
-    if _bl_viol_count < _MINIMUM_EXPECTED_VIOLATIONS:
-        result.baseline_compact_warning = True
-        _log.warning(
-            "Baseline has only %d violations (expected >= %d); comparison may be "
-            "incomplete. Re-export the baseline with full/non-compact mode to include "
-            "all default-state violations (e.g., VIRUS_DETECTED).",
-            _bl_viol_count,
-            _MINIMUM_EXPECTED_VIOLATIONS,
-        )
 
     # Build summary and calculate score with circuit breakers and tiers
     _build_summary(result)
