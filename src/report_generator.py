@@ -806,10 +806,8 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
 
     if is_waf:
         parts += [
-            "<h2 class='sec-h2'>WAF Violations — Learn / Alarm / Block</h2>",
-            _build_waf_violations_grouped_html(result),
             "<h2 class='sec-h2'>WAF Violations vs Baseline</h2>",
-            _build_waf_violation_table_html(result),
+            _build_waf_violations_vs_baseline_html(result),
             "<h2 class='sec-h2'>Applied Attack Signature Sets</h2>",
             _build_signature_sets_html(result),
         ]
@@ -889,42 +887,179 @@ def _waf_violation_comparison_rows(result: ComparisonResult) -> List[Dict[str, s
     return rows
 
 
-def _build_waf_violation_table_html(result: ComparisonResult) -> str:
+def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
     if getattr(result, "profile_type", "waf") != "waf":
         return ""
 
-    rows = _waf_violation_comparison_rows(result)
-    if not rows:
+    target_map = _normalize_violations_map(result.violations or [])
+    baseline_map = _normalize_violations_map(result.baseline_violations or [])
+
+    if not target_map and not baseline_map:
         return "<p class='muted'>No WAF violation settings were available for comparison.</p>"
 
-    body_rows = []
-    for row in rows:
-        body_rows.append(
-            "<tr>"
-            f"<td>{_esc(row['violation'])}</td>"
-            f"<td>{_esc(row['baseline_learn'])}</td>"
-            f"<td>{_esc(row['target_learn'])}</td>"
-            f"<td>{_esc(row['learn_match'])}</td>"
-            f"<td>{_esc(row['baseline_alarm'])}</td>"
-            f"<td>{_esc(row['target_alarm'])}</td>"
-            f"<td>{_esc(row['alarm_match'])}</td>"
-            f"<td>{_esc(row['baseline_block'])}</td>"
-            f"<td>{_esc(row['target_block'])}</td>"
-            f"<td>{_esc(row['block_match'])}</td>"
-            f"<td>{_esc(row['overall'])}</td>"
-            "</tr>"
+    def _is_active(v: Dict) -> bool:
+        return bool(v.get("block") or v.get("alarm") or v.get("enabled"))
+
+    bucket_a: List[Any] = []   # active on policy, not in baseline
+    bucket_b: List[Any] = []   # in both, all attrs match
+    bucket_c: List[Any] = []   # in both, at least one attr differs
+    bucket_e: List[Any] = []   # on policy, not active, not in baseline
+
+    for vid, v in target_map.items():
+        if vid in baseline_map:
+            b = baseline_map[vid]
+            if (v.get("alarm") == b.get("alarm")
+                    and v.get("block") == b.get("block")
+                    and v.get("learn") == b.get("learn")):
+                bucket_b.append((vid, v, b))
+            else:
+                bucket_c.append((vid, v, b))
+        else:
+            if _is_active(v):
+                bucket_a.append((vid, v))
+            else:
+                bucket_e.append((vid, v))
+
+    bucket_d: List[Any] = []   # in baseline, absent from policy
+    for vid, b in baseline_map.items():
+        if vid not in target_map:
+            bucket_d.append((vid, b))
+
+    EM = "&#8212;"
+
+    def _cell(val: Any, highlight: bool = False) -> str:
+        style = " style='background:#fdf2e9'" if highlight else ""
+        return f"<td{style}>{_esc(_fmt_setting(val))}</td>"
+
+    def _bucket_hdr(label: str, count: int, bg: str) -> str:
+        return (
+            f"<tr><td colspan='8' style='background:{bg};color:#fff;"
+            f"font-weight:bold;padding:8px 10px'>"
+            f"<strong>{_esc(label)}</strong> ({count})</td></tr>"
         )
 
-    return (
-        "<table class='results violation-compare'>"
+    def _none_row() -> str:
+        return (
+            "<tr><td colspan='8' class='muted'"
+            " style='font-style:italic;padding:6px 10px'>None</td></tr>"
+        )
+
+    tbody: List[str] = []
+
+    # Bucket A — active on policy, not in baseline
+    tbody.append(_bucket_hdr(
+        "Violations Active on Policy — Not in Baseline", len(bucket_a), "#e67e22"
+    ))
+    if bucket_a:
+        for vid, v in bucket_a:
+            tbody.append(
+                "<tr>"
+                f"<td>{_esc(_format_violation_name(v, vid))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('learn')))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('alarm')))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('block')))}</td>"
+                f"<td>{EM}</td><td>{EM}</td><td>{EM}</td>"
+                "<td style='color:#e67e22;font-weight:bold'>+ Added</td>"
+                "</tr>"
+            )
+    else:
+        tbody.append(_none_row())
+
+    # Bucket B — matching baseline
+    tbody.append(_bucket_hdr("Violations Matching Baseline", len(bucket_b), "#27ae60"))
+    if bucket_b:
+        for vid, v, b in bucket_b:
+            tbody.append(
+                "<tr>"
+                f"<td>{_esc(_format_violation_name(v, vid))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('learn')))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('alarm')))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('block')))}</td>"
+                f"<td>{_esc(_fmt_setting(b.get('learn')))}</td>"
+                f"<td>{_esc(_fmt_setting(b.get('alarm')))}</td>"
+                f"<td>{_esc(_fmt_setting(b.get('block')))}</td>"
+                "<td style='color:#27ae60;font-weight:bold'>&#10003; Match</td>"
+                "</tr>"
+            )
+    else:
+        tbody.append(_none_row())
+
+    # Bucket C — drift (differs from baseline)
+    tbody.append(_bucket_hdr("Violations Differing from Baseline", len(bucket_c), "#c0392b"))
+    if bucket_c:
+        for vid, v, b in bucket_c:
+            learn_diff = v.get("learn") != b.get("learn")
+            alarm_diff = v.get("alarm") != b.get("alarm")
+            block_diff = v.get("block") != b.get("block")
+            tbody.append(
+                "<tr>"
+                f"<td>{_esc(_format_violation_name(v, vid))}</td>"
+                + _cell(v.get("learn"), learn_diff)
+                + _cell(v.get("alarm"), alarm_diff)
+                + _cell(v.get("block"), block_diff)
+                + _cell(b.get("learn"), learn_diff)
+                + _cell(b.get("alarm"), alarm_diff)
+                + _cell(b.get("block"), block_diff)
+                + "<td style='color:#e67e22;font-weight:bold'>&#9888; Drift</td>"
+                "</tr>"
+            )
+    else:
+        tbody.append(_none_row())
+
+    # Bucket D — in baseline but absent from policy
+    tbody.append(_bucket_hdr(
+        "Baseline Violations Not Present in Policy", len(bucket_d), "#c0392b"
+    ))
+    if bucket_d:
+        for vid, b in bucket_d:
+            tbody.append(
+                "<tr>"
+                f"<td>{_esc(_format_violation_name(b, vid))}</td>"
+                f"<td>{EM}</td><td>{EM}</td><td>{EM}</td>"
+                f"<td>{_esc(_fmt_setting(b.get('learn')))}</td>"
+                f"<td>{_esc(_fmt_setting(b.get('alarm')))}</td>"
+                f"<td>{_esc(_fmt_setting(b.get('block')))}</td>"
+                "<td style='color:#c0392b;font-weight:bold'>&#10007; Missing</td>"
+                "</tr>"
+            )
+    else:
+        tbody.append(_none_row())
+
+    main_table = (
+        "<table class='results violation-vs-baseline'>"
         "<thead><tr>"
-        "<th>Violation</th><th>Baseline Learn</th><th>Policy Learn</th><th>Learn Match</th>"
-        "<th>Baseline Alarm</th><th>Policy Alarm</th><th>Alarm Match</th>"
-        "<th>Baseline Block</th><th>Policy Block</th><th>Block Match</th><th>Overall</th>"
-        "</tr></thead><tbody>"
-        + "".join(body_rows) +
-        "</tbody></table>"
+        "<th>Violation Name</th><th>Learn</th><th>Alarm</th><th>Block</th>"
+        "<th>Baseline Learn</th><th>Baseline Alarm</th><th>Baseline Block</th><th>Status</th>"
+        "</tr></thead>"
+        "<tbody>" + "".join(tbody) + "</tbody>"
+        "</table>"
     )
+
+    # Bucket E — out of scope (collapsed by default)
+    if bucket_e:
+        e_rows = [
+            f"<tr><td>{_esc(_format_violation_name(v, vid))}</td>"
+            "<td class='muted'>Not active on policy; not in baseline</td></tr>"
+            for vid, v in bucket_e
+        ]
+        e_inner = (
+            "<table class='results'>"
+            "<thead><tr><th>Violation Name</th><th>Note</th></tr></thead>"
+            "<tbody>" + "".join(e_rows) + "</tbody></table>"
+        )
+    else:
+        e_inner = "<p class='muted' style='font-style:italic'>No out-of-scope violations.</p>"
+
+    scope_block = (
+        "<details style='margin-top:12px'>"
+        "<summary style='color:#7f8c8d;font-style:italic;cursor:pointer;padding:4px 0'>"
+        f"&#9654; Out of Scope Violations ({len(bucket_e)}) &#8212; click to expand"
+        "</summary>"
+        f"<div style='padding:8px 0'>{e_inner}</div>"
+        "</details>"
+    )
+
+    return main_table + scope_block
 
 
 def _learning_mode_badge(mode: str) -> str:
@@ -934,42 +1069,6 @@ def _learning_mode_badge(mode: str) -> str:
     if m == "manual":
         return "<span class='policy-mode' style='background:#cce5ff;color:#004085'>Manual</span>"
     return "<span class='policy-mode' style='background:#e9ecef;color:#495057'>Off</span>"
-
-
-def _build_waf_violations_grouped_html(result: ComparisonResult) -> str:
-    if getattr(result, "profile_type", "waf") != "waf":
-        return ""
-
-    violations = result.violations or []
-
-    def _viol_name(v: Dict) -> str:
-        name = str(v.get("name") or "").strip()
-        return name if name else str(v.get("id") or "")
-
-    def _ul(items: List[Dict]) -> str:
-        if not items:
-            return "<ul><li class='muted'>None</li></ul>"
-        return "<ul>" + "".join(f"<li>{_esc(_viol_name(v))}</li>" for v in items) + "</ul>"
-
-    learn_items = [v for v in violations if v.get("learn")]
-    alarm_items = [v for v in violations if v.get("alarm")]
-    block_items = [v for v in violations if v.get("block")]
-
-    cards = (
-        "<div class='vcard'>"
-        "<div class='vcard-title learn'>Learn</div>"
-        + _ul(learn_items) +
-        "</div>"
-        "<div class='vcard'>"
-        "<div class='vcard-title alarm'>Alarm</div>"
-        + _ul(alarm_items) +
-        "</div>"
-        "<div class='vcard'>"
-        "<div class='vcard-title block'>Block</div>"
-        + _ul(block_items) +
-        "</div>"
-    )
-    return "<div class='violation-cards'>" + cards + "</div>"
 
 
 def _build_signature_sets_html(result: ComparisonResult) -> str:
