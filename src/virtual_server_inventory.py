@@ -227,6 +227,7 @@ def _is_http_profile(profile_item: Dict[str, Any], http_profiles: set[str], vs_p
 def _collect_virtual_server_inventory_impl(
     bigip_client: BigIPClient,
     partitions: Optional[List[str]] = None,
+    asm_policies_payload: Optional[Dict[str, Any]] = None,
 ) -> List[VirtualServerRecord]:
     partition_filter = {p.strip() for p in (partitions or []) if str(p).strip()}
 
@@ -234,7 +235,10 @@ def _collect_virtual_server_inventory_impl(
     virtual_payload = bigip_client.get("/mgmt/tm/ltm/virtual", params={"expandSubcollections": "true"})
     http_profiles_payload = bigip_client.get("/mgmt/tm/ltm/profile/http")
     ltm_policies_payload = bigip_client.get("/mgmt/tm/ltm/policy", params={"expandSubcollections": "true"})
-    asm_policies_payload = bigip_client.get("/mgmt/tm/asm/policies")
+    # Reuse pre-fetched ASM payload from discover_policies() when available so
+    # we avoid a duplicate call to /mgmt/tm/asm/policies.
+    if asm_policies_payload is None:
+        asm_policies_payload = bigip_client.get("/mgmt/tm/asm/policies")
 
     http_profile_paths: set[str] = set()
     for item in http_profiles_payload.get("items", []) or []:
@@ -368,13 +372,22 @@ def _collect_virtual_server_inventory_impl(
 def collect_virtual_server_inventory(
     bigip_client: BigIPClient,
     partitions: Optional[List[str]] = None,
+    asm_policies_payload: Optional[Dict[str, Any]] = None,
 ) -> List[VirtualServerRecord]:
     """Collect inventory records for virtual servers and WAF association context.
+
+    Pass ``asm_policies_payload`` (the raw response from a previous
+    /mgmt/tm/asm/policies GET) to avoid a duplicate API call when the caller
+    has already fetched that data (e.g. from PolicyExporter.discover_policies).
 
     This function is intentionally read-only and issues GET requests only.
     """
     _LOG.info("Collecting read-only virtual server inventory from BIG-IP")
-    return _collect_virtual_server_inventory_impl(bigip_client=bigip_client, partitions=partitions)
+    return _collect_virtual_server_inventory_impl(
+        bigip_client=bigip_client,
+        partitions=partitions,
+        asm_policies_payload=asm_policies_payload,
+    )
 
 
 __all__ = [

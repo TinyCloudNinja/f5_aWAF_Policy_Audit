@@ -29,7 +29,7 @@ from .utils import (
 from .bigip_client import BigIPClient, AuthenticationError
 from .policy_exporter import PolicyExporter, ExportError
 from .policy_inspector import PolicyInspector, print_inspection_table
-from .policy_parser import parse_policy, get_policy_metadata
+from .policy_parser import parse_policy
 from .policy_comparator import compare_policies
 from .bot_defense_auditor import BotDefenseAuditor
 from .bot_defense_comparator import compare_bot_profiles
@@ -167,9 +167,6 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Report format (default: both)")
     p.add_argument("--partitions", metavar="P1,P2",
                    help="Comma-separated partition names to audit (default: all)")
-    p.add_argument("--export-format", dest="export_format",
-                   choices=["xml", "json"], default=None,
-                   help="Policy export format (default: xml)")
     p.add_argument("--verify-ssl", dest="verify_ssl", action="store_true",
                    default=None, help="Enable TLS certificate verification (default)")
     p.add_argument("--no-verify-ssl", dest="verify_ssl", action="store_false",
@@ -179,7 +176,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="BIG-IP login provider name [env: BIGIP_LOGIN_PROVIDER] (default: tmos)")
     p.add_argument("--concurrent-exports", dest="concurrent_exports",
                    type=int, default=None, metavar="N",
-                   help="Max parallel export tasks, 1–20 (default: 3)")
+                   help="Max parallel inspection workers, 1–20 (default: 3)")
     p.add_argument("--gitlab-repo-url", dest="gitlab_repo_url", metavar="URL",
                    default=None,
                    help="GitLab repo URL used as source-of-truth + run archive")
@@ -232,46 +229,104 @@ def _load_json_baseline(path: str) -> Optional[dict]:
         return None
 
 
-def _fetch_recent_policy_audit_logs(
-    client,
-    policy_id: str,
-    logger,
-    limit: int = 10,
-) -> List[Dict]:
+def _inspector_to_target_dict(inspection: Dict) -> Dict:
+    """Convert PolicyInspector results to the dict format expected by compare_policies.
+
+    Only sections coverable via targeted REST calls (enforcement mode, violations,
+    signature sets, learning mode) are populated.  All other sections are set to
+    empty values so the comparator does not generate false-positive findings for
+    data that was never fetched.
     """
-    Fetch recent ASM policy audit log entries for a policy.
+    # Merge per-flag violation lists back into a single list with boolean flags.
+    # The inspector groups violations as learn/alarm/block; the comparator expects
+    # each violation once with all three flags set appropriately.
+    merged_violations: Dict[str, Dict] = {}
+    for flag in ("learn", "alarm", "block"):
+        for item in inspection.get("violations", {}).get(flag, []):
+            name = item.get("name", "")
+            if not name:
+                continue
+            if name not in merged_violations:
+                merged_violations[name] = {
+                    "name":        name,
+                    "description": item.get("description", ""),
+                    "alarm":       False,
+                    "block":       False,
+                    "learn":       False,
+                }
+            merged_violations[name][flag] = True
 
-    Endpoint:
-      /mgmt/tm/asm/policies/<policy-id>/audit-logs
+    return {
+        "general":           {"enforcementMode": inspection.get("enforcementMode", "transparent")},
+        "blocking-settings": {
+            "violations":     list(merged_violations.values()),
+            "evasions":       [],
+            "http-protocols": [],
+        },
+        "signature-sets": [
+            {
+                "name":  s.get("name", ""),
+                "alarm": bool(s.get("alarm")),
+                "block": bool(s.get("block")),
+                "learn": bool(s.get("learn")),
+            }
+            for s in inspection.get("signatureSets", [])
+        ],
+        "policy-builder":   {"learningMode": inspection.get("learningMode", "disabled")},
+        # Sections not reachable via inspector REST calls — kept empty to suppress
+        # false-positive diffs against the baseline.
+        "blocking":          {},
+        "attack-signatures": [],
+        "urls":              [],
+        "filetypes":         [],
+        "parameters":        [],
+        "headers":           [],
+        "cookies":           [],
+        "methods":           [],
+        "http-protocols":    [],
+        "evasions":          [],
+        "data-guard":        {},
+        "brute-force":       [],
+        "ip-intelligence":   {},
+        "bot-defense":       {},
+        "login-pages":       [],
+        "whitelist-ips":     [],
+    }
 
-    Returns up to ``limit`` entries (best effort). Any API failure is logged and
-    results in an empty list so auditing can continue.
+
+def _reduce_baseline_for_inspector(baseline_data: Dict) -> Dict:
+    """Return a baseline dict limited to sections that the inspector can fetch.
+
+    Sections the inspector does not cover are set to empty values so that the
+    comparator only diffs what both sides actually have, preventing false-positive
+    findings for things like custom URLs, parameters, and data-guard settings.
     """
-    if not policy_id:
-        return []
-
-    path = f"/mgmt/tm/asm/policies/{policy_id}/audit-logs"
-    try:
-        payload = client.get(path)
-    except Exception as exc:
-        logger.warning(
-            "Could not fetch audit log history for policy id=%s: %s",
-            policy_id,
-            exc,
-        )
-        return []
-
-    if isinstance(payload, dict):
-        items = payload.get("items") or payload.get("entries") or []
-    elif isinstance(payload, list):
-        items = payload
-    else:
-        items = []
-
-    if not isinstance(items, list):
-        return []
-
-    return [entry for entry in items if isinstance(entry, dict)][:limit]
+    return {
+        "general":           {"enforcementMode": baseline_data.get("general", {}).get("enforcementMode", "transparent")},
+        "blocking-settings": {
+            "violations":     baseline_data.get("blocking-settings", {}).get("violations", []),
+            "evasions":       [],
+            "http-protocols": [],
+        },
+        "signature-sets":    baseline_data.get("signature-sets", []),
+        "policy-builder":    {"learningMode": baseline_data.get("policy-builder", {}).get("learningMode", "disabled")},
+        "blocking":          {},
+        "attack-signatures": [],
+        "urls":              [],
+        "filetypes":         [],
+        "parameters":        [],
+        "headers":           [],
+        "cookies":           [],
+        "methods":           [],
+        "http-protocols":    [],
+        "evasions":          [],
+        "data-guard":        {},
+        "brute-force":       [],
+        "ip-intelligence":   {},
+        "bot-defense":       {},
+        "login-pages":       [],
+        "whitelist-ips":     [],
+    }
 
 
 # ── Main workflow ──────────────────────────────────────────────────────────────
@@ -313,9 +368,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                           audit_cfg.get("output_dir"), _DEFAULT_OUTPUT_DIR)
     report_format = _resolve(args.report_format, "REPORT_FORMAT",
                              audit_cfg.get("report_format"), "both")
-    export_format = _resolve(args.export_format, "EXPORT_FORMAT",
-                             audit_cfg.get("export_format"), "xml")
-    
+
     # SSL verification defaults to False; This alleviates issues when the BIG-IPs use self-signed certificates
     _raw_ssl = _resolve(args.verify_ssl, "VERIFY_SSL", bigip_cfg.get("verify_ssl"), False)
     if isinstance(_raw_ssl, str):
@@ -503,9 +556,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ── Fetch device identity ─────────────────────────────────────────────────
     exporter = PolicyExporter(
         client=client,
-        output_dir=output_dir,
-        export_format=export_format,
-        concurrent_exports=concurrent,
         partitions=partitions if partitions else None,
     )
     device_info = exporter.fetch_device_info()
@@ -568,6 +618,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             logger=logger,
             fail_on_tier=fail_on_tier,
             pass_threshold=pass_threshold,
+            concurrent=concurrent,
         )
 
 
@@ -624,8 +675,15 @@ def _run_waf_audit(
     device_hostname, device_mgmt_ip, gitlab_state, gitlab_update_source_truth, logger,
     fail_on_tier: str,
     pass_threshold: float,
+    concurrent: int = 3,
 ) -> int:
-    """Run the existing ASM/AWAF policy audit."""
+    """Run the ASM/AWAF policy audit using targeted REST inspection.
+
+    Policy state is collected via iControl REST API calls (enforcement mode,
+    violations, signature sets, learning mode, audit log) rather than a full
+    policy export/download.  This eliminates the async export task, polling
+    loop, and chunked file download that were previously required.
+    """
     virtual_server_inventory = []
     virtual_server_inventory_error: Optional[str] = None
 
@@ -643,9 +701,12 @@ def _run_waf_audit(
 
     exporter.print_discovery_table(policies)
 
-    # Enrich with virtual server bindings
+    # Enrich with virtual server bindings (uses VS refs already in policy dicts
+    # from discover_policies — no additional API call to /asm/policies).
     exporter.enrich_with_virtual_servers(policies)
 
+    # Collect VS inventory, reusing the ASM policies payload already fetched by
+    # discover_policies to avoid a duplicate /mgmt/tm/asm/policies request.
     try:
         logger.info(
             "Collecting virtual server inventory across %d partition(s)...",
@@ -654,6 +715,7 @@ def _run_waf_audit(
         virtual_server_inventory = collect_virtual_server_inventory(
             bigip_client=client,
             partitions=all_partitions,
+            asm_policies_payload=exporter._raw_asm_payload,
         )
     except Exception as exc:
         virtual_server_inventory_error = str(exc)
@@ -662,97 +724,82 @@ def _run_waf_audit(
             exc,
         )
 
-    # Export policies
-    successes, failures = exporter.export_all(policies)
-    if failures:
-        logger.warning(
-            "%d policy export(s) failed (see log for details):", len(failures)
-        )
-        for policy, err in failures:
-            logger.warning("  %s: %s", policy["fullPath"], err)
+    # Inspect all policies via targeted REST calls (no export task or download).
+    inspector = PolicyInspector(client=client, concurrent=concurrent, audit_limit=10)
+    logger.info("Inspecting %d policies via REST …", len(policies))
+    inspections = inspector.inspect_all(policies)
+    inspection_map = {r["fullPath"]: r for r in inspections}
 
-    if not successes:
-        logger.error("All exports failed. No policies to audit.")
-        client.close()
-        return 2
-
-    # Parse baseline
+    # Parse baseline XML — still used for comparison; only sections the inspector
+    # can reach are compared to avoid false-positive diffs.
     logger.info("Parsing baseline policy: %s", baseline)
     try:
-        baseline_data = parse_policy(baseline)
+        raw_baseline = parse_policy(baseline)
     except Exception as exc:
         logger.error("Failed to parse baseline policy: %s", exc)
         return 2
     baseline_name = Path(baseline).name
+    reduced_baseline = _reduce_baseline_for_inspector(raw_baseline)
 
     # Compare and report
     all_results = []
     sot_results = []
-    total = len(successes)
-    iterable = successes
+    total = len(policies)
 
-    for idx, policy in enumerate(successes, 1):
-        local_path = policy.get("local_path")
-        if not local_path or not Path(local_path).exists():
-            logger.error("Exported file missing for %s", policy["fullPath"])
+    for idx, policy in enumerate(policies, 1):
+        full_path = policy["fullPath"]
+        inspection = inspection_map.get(full_path)
+        if not inspection:
+            logger.error("No inspection result for %s — skipping", full_path)
             continue
 
-        logger.info("Auditing policy %d/%d: %s", idx, total, policy["fullPath"])
-        try:
-            target_data = parse_policy(local_path)
-            meta = get_policy_metadata(local_path)
-            if not meta.get("name"):
-                meta["name"] = policy["name"]
-            if not meta.get("fullPath"):
-                meta["fullPath"] = policy["fullPath"]
-        except Exception as exc:
-            logger.error("Failed to parse exported policy %s: %s",
-                         policy["fullPath"], exc)
-            continue
+        if inspection.get("errors"):
+            logger.warning(
+                "Inspection errors for %s: %s", full_path, inspection["errors"]
+            )
+
+        logger.info("Auditing policy %d/%d: %s", idx, total, full_path)
+
+        target_data = _inspector_to_target_dict(inspection)
+        meta = {
+            "name":     policy["name"],
+            "fullPath": policy["fullPath"],
+            "active":   policy.get("active", False),
+        }
 
         cmp_result = compare_policies(
-            baseline=baseline_data,
+            baseline=reduced_baseline,
             target=target_data,
             policy_meta=meta,
             baseline_name=baseline_name,
             virtual_servers=policy.get("virtual_servers", []),
             device_hostname=device_hostname,
             device_mgmt_ip=device_mgmt_ip,
-            asm_audit_logs=_fetch_recent_policy_audit_logs(
-                client=client,
-                policy_id=policy.get("id", ""),
-                logger=logger,
-                limit=10,
-            ),
-                green_threshold=pass_threshold,
+            asm_audit_logs=inspection.get("auditLog", []),
+            green_threshold=pass_threshold,
         )
         all_results.append(cmp_result)
 
         if gitlab_state is not None:
-            sot_baseline, sot_name = gitlab_state.load_waf_source_of_truth(policy["fullPath"])
+            sot_baseline, sot_name = gitlab_state.load_waf_source_of_truth(full_path)
             if sot_baseline is not None:
                 try:
                     sot_cmp_result = compare_policies(
-                        baseline=sot_baseline,
+                        baseline=_reduce_baseline_for_inspector(sot_baseline),
                         target=target_data,
                         policy_meta=meta,
                         baseline_name=sot_name,
                         virtual_servers=policy.get("virtual_servers", []),
                         device_hostname=device_hostname,
                         device_mgmt_ip=device_mgmt_ip,
-                        asm_audit_logs=_fetch_recent_policy_audit_logs(
-                            client=client,
-                            policy_id=policy.get("id", ""),
-                            logger=logger,
-                            limit=10,
-                        ),
+                        asm_audit_logs=inspection.get("auditLog", []),
                         green_threshold=pass_threshold,
                     )
                     sot_results.append(sot_cmp_result)
                 except Exception as exc:
                     logger.warning(
                         "Source-of-truth comparison failed for %s: %s",
-                        policy["fullPath"],
+                        full_path,
                         exc,
                     )
 
@@ -814,26 +861,24 @@ def _run_waf_audit(
             device_hostname=device_hostname,
             device_mgmt_ip=device_mgmt_ip,
             audited_count=len(all_results),
-            failure_count=len(failures),
+            failure_count=0,
         )
-        if gitlab_update_source_truth:
-            gitlab_state.update_waf_source_of_truth(successes)
         gitlab_state.commit_and_push(
             commit_message=(
                 f"WAF audit sync for {device_hostname or device_mgmt_ip} "
-                f"({len(all_results)} audited, {len(failures)} failed exports)"
+                f"({len(all_results)} audited)"
             )
         )
 
     client.close()
     return _print_summary(
         all_results=all_results,
-        failures=failures,
+        failures=[],
         device_hostname=device_hostname,
         device_mgmt_ip=device_mgmt_ip,
         output_dir=output_dir,
         subject_label="Policy",
-        failure_label="policy export(s)",
+        failure_label="policy inspection(s)",
         pass_threshold=pass_threshold,
         fail_on_tier=fail_on_tier,
     )

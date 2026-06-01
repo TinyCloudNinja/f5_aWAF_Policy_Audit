@@ -1,18 +1,12 @@
 """
-Policy discovery, export initiation, polling, and download.
+Policy discovery and virtual server enrichment.
 
-All export operations are read-only against the BIG-IP device.
+All operations are read-only against the BIG-IP device.
 """
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .bigip_client import BigIPClient
-from .utils import get_logger, normalize_full_path, policy_export_filename, ensure_dir
-
-_POLL_INTERVAL = 3       # seconds between status polls
-_POLL_TIMEOUT  = 120     # max seconds to wait for a single export task
+from .utils import get_logger
 
 
 def _parse_destination(destination: str) -> Tuple[str, str]:
@@ -100,35 +94,34 @@ class ExportError(Exception):
 
 class PolicyExporter:
     """
-    Discovers all ASM/AWAF policies across partitions and exports them.
+    Discovers all ASM/AWAF policies across partitions and resolves their
+    virtual server associations via direct iControl REST calls.
     """
 
-    _PARTITION_EP    = "/mgmt/tm/auth/partition"
-    _POLICY_EP       = (
+    _PARTITION_EP  = "/mgmt/tm/auth/partition"
+    # Single fetch covers both audit metadata and VS binding fields, eliminating
+    # a previously separate call to /mgmt/tm/asm/policies?$select=…virtualServers….
+    _POLICY_EP     = (
         "/mgmt/tm/asm/policies"
         "?$select=id,name,fullPath,active,enforcementMode,type,"
-        "versionDatetime,hasParent,protocolIndependent"
+        "versionDatetime,hasParent,protocolIndependent,"
+        "virtualServers,manualVirtualServers,selfLink"
     )
-    _EXPORT_TASK_EP  = "/mgmt/tm/asm/tasks/export-policy"
-    _DOWNLOAD_BASE_EP = "/mgmt/tm/asm/file-transfer/downloads"
-    _VIRTUAL_EP      = "/mgmt/tm/ltm/virtual"
-    _LTM_POLICY_EP   = "/mgmt/tm/ltm/policy"
-    _SYS_GLOBAL_EP   = "/mgmt/tm/sys/global-settings"
+    _VIRTUAL_EP    = "/mgmt/tm/ltm/virtual"
+    _LTM_POLICY_EP = "/mgmt/tm/ltm/policy"
+    _SYS_GLOBAL_EP = "/mgmt/tm/sys/global-settings"
 
     def __init__(
         self,
         client: BigIPClient,
-        output_dir: str,
-        export_format: str = "xml",
-        concurrent_exports: int = 3,
         partitions: Optional[List[str]] = None,
     ):
         self.client = client
-        self.export_dir = ensure_dir(Path(output_dir) / "exports")
-        self.export_format = export_format
-        self.concurrent = concurrent_exports
         self.filter_partitions = [p.strip() for p in partitions] if partitions else []
         self.log = get_logger("policy_exporter")
+        # Raw unfiltered API response stored after discover_policies() so that
+        # virtual_server_inventory can reuse it without a duplicate fetch.
+        self._raw_asm_payload: Optional[Dict] = None
 
     # ── Device information ──────────────────────────────────────────────────────
 
@@ -178,12 +171,25 @@ class PolicyExporter:
         return names
 
     def discover_policies(self, partitions: List[str]) -> List[Dict]:
-        """Return a list of policy metadata dicts filtered by partition list."""
+        """Return a list of policy metadata dicts filtered by partition list.
+
+        A single GET to _POLICY_EP fetches both the policy metadata and the
+        virtualServers / manualVirtualServers binding fields, replacing what
+        was previously two separate API calls.  The raw response is stored in
+        ``self._raw_asm_payload`` so callers (e.g. virtual_server_inventory)
+        can reuse it without issuing a duplicate request.
+
+        Each returned dict includes private ``_virtualServers`` and
+        ``_manualVirtualServers`` keys consumed by enrich_with_virtual_servers().
+        """
         self.log.info("Enumerating ASM/AWAF policies …")
         try:
             data = self.client.get(self._POLICY_EP)
         except Exception as exc:
             raise ExportError(f"Failed to enumerate policies: {exc}") from exc
+
+        # Store for sharing with virtual_server_inventory
+        self._raw_asm_payload = data
 
         policies = []
         for item in data.get("items", []):
@@ -206,14 +212,18 @@ class PolicyExporter:
                 continue
 
             policies.append({
-                "id":              item.get("id", ""),
-                "name":            item.get("name", ""),
-                "fullPath":        full_path,
-                "partition":       partition,
-                "active":          bool(item.get("active", False)),
-                "enforcementMode": item.get("enforcementMode", "transparent"),
-                "type":            item.get("type", "security"),
-                "versionDatetime": item.get("versionDatetime", ""),
+                "id":                    item.get("id", ""),
+                "name":                  item.get("name", ""),
+                "fullPath":              full_path,
+                "partition":             partition,
+                "active":                bool(item.get("active", False)),
+                "enforcementMode":       item.get("enforcementMode", "transparent"),
+                "type":                  item.get("type", "security"),
+                "versionDatetime":       item.get("versionDatetime", ""),
+                "selfLink":              item.get("selfLink", ""),
+                # VS binding refs consumed by enrich_with_virtual_servers()
+                "_virtualServers":       item.get("virtualServers", []),
+                "_manualVirtualServers": item.get("manualVirtualServers", []),
             })
 
         self.log.info("Discovered %d ASM/AWAF policies.", len(policies))
@@ -265,79 +275,26 @@ class PolicyExporter:
         """
         Enrich each policy dict in-place with a ``virtual_servers`` list.
 
-        Issues a single GET to::
-
-            /mgmt/tm/asm/policies?$select=name,fullPath,virtualServers,manualVirtualServers
-
-        to collect both direct and manual LTM-policy-based VS associations in
-        one API call, then resolves each VS reference to a full detail dict.
-
-        Two fields are queried because BIG-IP tracks associations in two places:
-
-        * ``virtualServers``       – VSes with the ASM policy attached directly
-                                    via the Security > Policies GUI tab.  BIG-IP
-                                    auto-creates an ``asm_auto_l7_policy__<vs>``
-                                    LTM policy for each of these.
-        * ``manualVirtualServers`` – VSes that reference the ASM policy through
-                                    a manually-created Local Traffic Policy with
-                                    ASM control actions (e.g. Host-Header routing
-                                    rules).  Querying only ``virtualServers``
-                                    misses these entirely.
+        VS binding references (``_virtualServers`` / ``_manualVirtualServers``)
+        were fetched as part of discover_policies() in the same API call, so
+        no additional policy-level API request is needed here.  Each reference
+        is then resolved to a full VS detail dict via targeted GET calls.
 
         Each entry in ``virtual_servers`` is a dict with keys:
           name, fullPath, destination, ip, port, association_type, ltm_policies
 
         ``association_type`` is ``"direct"`` for ``virtualServers`` entries and
         ``"manual"`` for ``manualVirtualServers`` entries.
-
-        This is a best-effort operation: failures are logged and result in an
-        empty list for the affected policy.
         """
-        self.log.info("Fetching virtual server bindings for %d policies …", len(policies))
-        vs_map = self._fetch_policy_vs_map()
+        self.log.info("Resolving virtual server bindings for %d policies …", len(policies))
         for policy in policies:
-            full_path = policy.get("fullPath", "")
-            vs_data = vs_map.get(full_path, {})
+            direct_refs = policy.pop("_virtualServers", [])
+            manual_refs = policy.pop("_manualVirtualServers", [])
             policy["virtual_servers"] = self._resolve_vs_refs(
-                vs_data.get("virtualServers", []),
-                vs_data.get("manualVirtualServers", []),
-                full_path,
+                direct_refs,
+                manual_refs,
+                policy.get("fullPath", ""),
             )
-
-    def _fetch_policy_vs_map(self) -> Dict[str, Dict]:
-        """
-        Return a map of policy fullPath → {virtualServers, manualVirtualServers}.
-
-        Makes a single GET request::
-
-            GET /mgmt/tm/asm/policies?$select=name,fullPath,virtualServers,manualVirtualServers
-
-        On failure the map is empty and enrichment will silently yield no
-        virtual server bindings (already logged as a warning).
-        """
-        try:
-            data = self.client.get(
-                "/mgmt/tm/asm/policies",
-                params={"$select": "name,fullPath,virtualServers,manualVirtualServers"},
-            )
-        except Exception as exc:
-            self.log.warning(
-                "Could not fetch policy VS associations: %s. "
-                "Virtual server bindings will be empty.",
-                exc,
-            )
-            return {}
-
-        result: Dict[str, Dict] = {}
-        for item in data.get("items", []):
-            full_path = item.get("fullPath", "")
-            if not full_path.startswith("/"):
-                full_path = f"/Common/{full_path}"
-            result[full_path] = {
-                "virtualServers":       item.get("virtualServers", []),
-                "manualVirtualServers": item.get("manualVirtualServers", []),
-            }
-        return result
 
     def _resolve_vs_refs(
         self,
@@ -479,123 +436,3 @@ class PolicyExporter:
                 })
 
         return rules
-
-    # ── Export workflow ────────────────────────────────────────────────────────
-
-    def export_all(
-        self, policies: List[Dict]
-    ) -> Tuple[List[Dict], List[Tuple[Dict, str]]]:
-        """
-        Export all policies concurrently.
-
-        Returns:
-            (successes, failures)
-            successes: policy dicts enriched with 'local_path'
-            failures:  list of (policy_dict, error_message)
-        """
-        successes: List[Dict] = []
-        failures: List[Tuple[Dict, str]] = []
-        total = len(policies)
-
-        self.log.info("Exporting %d policies (concurrency=%d) …", total, self.concurrent)
-
-        with ThreadPoolExecutor(max_workers=self.concurrent) as pool:
-            future_to_policy = {
-                pool.submit(self._export_one, policy, idx + 1, total): policy
-                for idx, policy in enumerate(policies)
-            }
-            for future in as_completed(future_to_policy):
-                policy = future_to_policy[future]
-                try:
-                    local_path = future.result()
-                    policy["local_path"] = str(local_path)
-                    successes.append(policy)
-                except Exception as exc:
-                    msg = str(exc)
-                    self.log.error(
-                        "Export FAILED for %s: %s", policy["fullPath"], msg
-                    )
-                    failures.append((policy, msg))
-
-        return successes, failures
-
-    def _export_one(
-        self, policy: Dict, index: int, total: int
-    ) -> Path:
-        """Full export lifecycle for a single policy. Returns local file path."""
-        full_path = policy["fullPath"]
-        policy_id = policy["id"]
-        self.log.info("Exporting policy %d/%d: %s …", index, total, full_path)
-
-        filename = policy_export_filename(full_path, self.export_format)
-
-        # Step 1 – initiate export task
-        task_resp = self.client.post(
-            self._EXPORT_TASK_EP,
-            data={
-                "filename": filename,
-                "minimal": True,
-                "policyReference": {
-                    "link": f"https://localhost/mgmt/tm/asm/policies/{policy_id}"
-                },
-            },
-        )
-        task_id = task_resp.get("id")
-        if not task_id:
-            raise ExportError(f"No task ID returned for policy {full_path}")
-
-        # Step 2 – poll for completion
-        status, result = self._poll_task(task_id, full_path)
-        if status != "COMPLETED":
-            raise ExportError(
-                f"Export task for {full_path} ended with status '{status}'"
-            )
-
-        # Step 3 – download
-        # Strip any directory components from the server-supplied filename to
-        # prevent path traversal (e.g. "../../etc/cron.d/evil").
-        raw_filename = result.get("filename", filename)
-        reported_filename = Path(raw_filename).name or filename
-        expected_size: Optional[int] = result.get("fileSize")
-        local_path = self.export_dir / reported_filename
-        dl_path = f"{self._DOWNLOAD_BASE_EP}/{reported_filename}"
-        self.log.info("Downloading: %s → %s", reported_filename, local_path)
-        written = self.client.download_file(dl_path, str(local_path), expected_size=expected_size)
-
-        # Validate size
-        if expected_size and written != expected_size:
-            self.log.warning(
-                "Size mismatch for %s: expected %d bytes, got %d bytes.",
-                reported_filename, expected_size, written
-            )
-
-        self.log.info("Policy exported: %s (%d bytes)", local_path.name, written)
-        return local_path
-
-    def _poll_task(self, task_id: str, label: str) -> Tuple[str, Dict]:
-        """
-        Poll the export-policy task endpoint until COMPLETED or FAILURE.
-
-        Returns (status_string, result_dict).
-        """
-        deadline = time.monotonic() + _POLL_TIMEOUT
-        poll_url = f"{self._EXPORT_TASK_EP}/{task_id}"
-
-        while time.monotonic() < deadline:
-            try:
-                data = self.client.get(poll_url)
-            except Exception as exc:
-                self.log.warning("Poll error for task %s: %s", task_id, exc)
-                time.sleep(_POLL_INTERVAL)
-                continue
-
-            status = data.get("status", "").upper()
-            if status in ("COMPLETED", "FAILURE"):
-                return status, data.get("result", data)
-
-            self.log.debug("Task %s for %s: status=%s", task_id, label, status)
-            time.sleep(_POLL_INTERVAL)
-
-        raise ExportError(
-            f"Export task {task_id} for {label} timed out after {_POLL_TIMEOUT}s"
-        )
