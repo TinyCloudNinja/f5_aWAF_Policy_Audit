@@ -5,12 +5,18 @@ Fetches only what the reporting use-case needs (violations, learning mode,
 signature sets, audit log, enforcement mode) via direct GET calls — no
 export task, no XML download, no polling.
 """
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from typing import Dict, List, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
+
+import requests
 
 from .bigip_client import BigIPClient
 from .utils import get_logger
+
+PAGE_SIZE = 25       # items per page for audit-log pagination
+MAX_AUDIT_PAGES = 100  # safety cap to prevent infinite loops on huge policies
 
 
 class PolicyInspector:
@@ -54,6 +60,8 @@ class PolicyInspector:
             "violations":      {"learn": [], "alarm": [], "block": []},
             "signatureSets":   [],
             "auditLog":        [],
+            "auditLogTotal":   0,
+            "auditLogError":   None,
             "errors":          [],
         }
 
@@ -69,8 +77,10 @@ class PolicyInspector:
         result["signatureSets"] = sig_sets
         result["errors"].extend(errs)
 
-        audit, errs = self._fetch_audit(policy_id)
+        audit, audit_total, audit_error, errs = self._fetch_audit(policy_id)
         result["auditLog"] = audit
+        result["auditLogTotal"] = audit_total
+        result["auditLogError"] = audit_error
         result["errors"].extend(errs)
 
         return result
@@ -107,6 +117,8 @@ class PolicyInspector:
                         "violations":      {"learn": [], "alarm": [], "block": []},
                         "signatureSets":   [],
                         "auditLog":        [],
+                        "auditLogTotal":   0,
+                        "auditLogError":   None,
                         "errors":          [f"inspect_one raised: {exc}"],
                     })
 
@@ -202,19 +214,83 @@ class PolicyInspector:
 
         return sets, []
 
-    def _fetch_audit(self, policy_id: str) -> Tuple[List, List[str]]:
-        """GET audit-log entries via the per-policy audit-logs endpoint."""
+    def _fetch_audit(
+        self, policy_id: str
+    ) -> Tuple[List, int, Optional[str], List[str]]:
+        """GET audit-log entries via paginated OData calls (K000140107).
+
+        Returns (items, total_items, audit_error, errors).
+        """
         if not policy_id:
-            return [], ["audit: no policy_id available"]
+            return [], 0, None, ["audit: no policy_id available"]
+
+        base_path = f"/mgmt/tm/asm/policies/{policy_id}/audit-logs"
+        _FIELDS = (
+            "eventType,lastUpdateMicros,description,"
+            "entityName,component,username,deviceName,id"
+        )
+
+        # Step 1: lightweight count call
+        total_items = 0
         try:
-            data = self.client.get(
-                f"/mgmt/tm/asm/policies/{policy_id}/audit-logs",
-                params={"$top": str(self.audit_limit)},
-            )
-            items = data.get("items", [])[: self.audit_limit]
-            return [_format_audit_entry(i) for i in items], []
-        except Exception as exc:
-            return [], [f"audit: {exc}"]
+            count_data = self.client.get(base_path, params={"$select": "totalItems"})
+            total_items = int(count_data.get("totalItems", 0))
+            self.log.debug("Audit log total for %s: %d", policy_id, total_items)
+        except (requests.exceptions.RequestException, Exception) as exc:
+            audit_error = f"audit count: {exc}"
+            return [], 0, audit_error, [audit_error]
+
+        if total_items == 0:
+            return [], 0, None, []
+
+        # Step 2: paginate through all records
+        all_items: List[Dict] = []
+        skip = 0
+        pages_fetched = 0
+
+        while True:
+            if pages_fetched >= MAX_AUDIT_PAGES:
+                msg = (
+                    f"audit: MAX_AUDIT_PAGES ({MAX_AUDIT_PAGES}) reached for "
+                    f"policy {policy_id}; {len(all_items)} of {total_items} items fetched"
+                )
+                self.log.warning(msg)
+                return (
+                    [_format_audit_entry(i) for i in all_items],
+                    total_items,
+                    None,
+                    [msg],
+                )
+
+            try:
+                page_data = self.client.get(
+                    base_path,
+                    params={
+                        "$top": str(PAGE_SIZE),
+                        "$skip": str(skip),
+                        "$select": _FIELDS,
+                    },
+                )
+            except (requests.exceptions.RequestException, Exception) as exc:
+                audit_error = f"audit page (skip={skip}): {exc}"
+                return (
+                    [_format_audit_entry(i) for i in all_items],
+                    total_items,
+                    audit_error,
+                    [audit_error],
+                )
+
+            page_items = page_data.get("items", [])
+            all_items.extend(page_items)
+            pages_fetched += 1
+
+            if len(page_items) < PAGE_SIZE or len(all_items) >= total_items:
+                break
+
+            skip += PAGE_SIZE
+            time.sleep(0.5)
+
+        return [_format_audit_entry(i) for i in all_items], total_items, None, []
 
 
 # ── Module-level helpers ───────────────────────────────────────────────────────
@@ -238,17 +314,19 @@ def _format_audit_entry(item: Dict) -> Dict:
     micros = item.get("lastUpdateMicros")
     if micros is not None:
         try:
-            ts = datetime.utcfromtimestamp(int(micros) / 1_000_000).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            )
+            dt = datetime.fromtimestamp(int(micros) / 1_000_000, tz=timezone.utc)
+            ts = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
         except (ValueError, TypeError, OSError):
             ts = ""
     if not ts:
         ts = str(item.get("dateTime") or item.get("date") or "")
     return {
-        "action":    item.get("action", ""),
-        "username":  item.get("username", ""),
-        "timestamp": ts,
+        "timestamp":   ts,
+        "eventType":   str(item.get("eventType") or ""),
+        "component":   str(item.get("component") or ""),
+        "entityName":  str(item.get("entityName") or ""),
+        "description": str(item.get("description") or ""),
+        "username":    str(item.get("username") or ""),
     }
 
 

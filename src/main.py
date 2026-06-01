@@ -776,6 +776,8 @@ def _run_waf_audit(
             device_hostname=device_hostname,
             device_mgmt_ip=device_mgmt_ip,
             asm_audit_logs=inspection.get("auditLog", []),
+            asm_audit_log_total=inspection.get("auditLogTotal", 0),
+            asm_audit_log_error=inspection.get("auditLogError"),
             green_threshold=pass_threshold,
         )
         all_results.append(cmp_result)
@@ -793,6 +795,8 @@ def _run_waf_audit(
                         device_hostname=device_hostname,
                         device_mgmt_ip=device_mgmt_ip,
                         asm_audit_logs=inspection.get("auditLog", []),
+                        asm_audit_log_total=inspection.get("auditLogTotal", 0),
+                        asm_audit_log_error=inspection.get("auditLogError"),
                         green_threshold=pass_threshold,
                     )
                     sot_results.append(sot_cmp_result)
