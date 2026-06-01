@@ -122,6 +122,10 @@ class ComparisonResult:
     policy_audit_logs: List[Dict] = field(default_factory=list)
     # Recent ASM security policy change history (from /audit-logs)
     asm_audit_logs: List[Dict] = field(default_factory=list)
+    # Total audit log entries on device (may exceed items fetched)
+    asm_audit_log_total: int = 0
+    # Non-None when the audit log fetch failed
+    asm_audit_log_error: Optional[str] = None
     # Tiered scoring metadata
     tier: str = TIER_GREEN
     tier_label: str = "Compliant"
@@ -154,6 +158,8 @@ def compare_policies(
     device_mgmt_ip: str = "",
     policy_audit_logs: Optional[List[Dict]] = None,
     asm_audit_logs: Optional[List[Dict]] = None,
+    asm_audit_log_total: int = 0,
+    asm_audit_log_error: Optional[str] = None,
     green_threshold: float = 90.0,
 ) -> ComparisonResult:
     """
@@ -202,6 +208,8 @@ def compare_policies(
         policy_audit_logs=policy_audit_logs or [],
         device_mgmt_ip=device_mgmt_ip,
         asm_audit_logs=asm_audit_logs or [],
+        asm_audit_log_total=asm_audit_log_total,
+        asm_audit_log_error=asm_audit_log_error,
     )
 
     # First pass: gather all findings

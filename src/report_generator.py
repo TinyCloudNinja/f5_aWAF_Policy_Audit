@@ -68,6 +68,7 @@ def generate_markdown(result: ComparisonResult, output_dir: str) -> Path:
     _md_circuit_breakers(lines, result)
     _md_deductions(lines, result)
     _md_waf_violations(lines, result)
+    _md_audit_logs(lines, result)
     _md_findings(lines, result)
 
     out_path.write_text("\n".join(lines), encoding="utf-8")
@@ -191,6 +192,40 @@ def _md_findings(lines: List[str], result: ComparisonResult) -> None:
                 f"- **Description:** {diff.description}",
                 "",
             ]
+
+
+def _md_audit_logs(lines: List[str], result: ComparisonResult) -> None:
+    """Render the audit log section in GFM Markdown."""
+    lines += ["## Audit Log (Last 10 Changes)", ""]
+
+    error = getattr(result, "asm_audit_log_error", None)
+    if error:
+        lines += [f"> ⚠️ Audit log retrieval failed: {error}", ""]
+        return
+
+    total_items = getattr(result, "asm_audit_log_total", 0)
+    all_logs = list(result.asm_audit_logs or [])
+    display_logs = all_logs[:10]
+
+    lines.append(
+        f"Total audit log entries: **{total_items}** | Displayed: **{len(display_logs)}**"
+    )
+    lines.append("")
+
+    if not display_logs:
+        lines += ["_No audit log entries found._", ""]
+        return
+
+    lines.append("| Timestamp | Event Type | Component | Entity | Description |")
+    lines.append("|-----------|------------|-----------|--------|-------------|")
+    for entry in display_logs:
+        ts = str(entry.get("timestamp") or "").replace("|", "\\|")
+        event_type = str(entry.get("eventType") or "").replace("|", "\\|")
+        component = str(entry.get("component") or "").replace("|", "\\|")
+        entity = str(entry.get("entityName") or "").replace("|", "\\|")
+        description = str(entry.get("description") or "").replace("|", "\\|")
+        lines.append(f"| {ts} | {event_type} | {component} | {entity} | {description} |")
+    lines.append("")
 
 
 # ----------------------------------------------------------------------------
@@ -959,20 +994,52 @@ def _build_signature_sets_html(result: ComparisonResult) -> str:
 
 
 def _build_audit_log_html(result: ComparisonResult) -> str:
-    logs = (result.policy_audit_logs or [])[:10]
-    if not logs:
-        return "<p class='muted'>No audit log entries available.</p>"
+    error = getattr(result, "asm_audit_log_error", None)
+    if error:
+        return (
+            "<div class='error-box'>"
+            f"&#9888; Audit log retrieval failed: {_esc(error)}"
+            "</div>"
+        )
+
+    total_items = getattr(result, "asm_audit_log_total", 0)
+    all_logs = list(result.asm_audit_logs or [])
+    display_logs = all_logs[:10]
+
+    summary = (
+        f"<p class='audit-summary'>Total audit log entries: <strong>{total_items}</strong> "
+        f"| Displayed: <strong>{len(display_logs)}</strong></p>"
+    )
+
+    if not display_logs:
+        return (
+            summary
+            + "<table class='results'>"
+            "<thead><tr>"
+            "<th>Timestamp</th><th>Event Type</th><th>Component</th><th>Entity</th><th>Description</th>"
+            "</tr></thead>"
+            "<tbody><tr><td colspan='5' class='muted'>No audit log entries found.</td></tr></tbody>"
+            "</table>"
+        )
 
     body_rows = []
-    for entry in logs:
-        action = _esc(str(entry.get("action") or ""))
-        username = _esc(str(entry.get("username") or ""))
-        timestamp = _esc(str(entry.get("timestamp") or ""))
-        body_rows.append(f"<tr><td>{action}</td><td>{username}</td><td>{timestamp}</td></tr>")
+    for entry in display_logs:
+        ts = _esc(str(entry.get("timestamp") or ""))
+        event_type = _esc(str(entry.get("eventType") or ""))
+        component = _esc(str(entry.get("component") or ""))
+        entity = _esc(str(entry.get("entityName") or ""))
+        description = _esc(str(entry.get("description") or ""))
+        body_rows.append(
+            f"<tr><td>{ts}</td><td>{event_type}</td>"
+            f"<td>{component}</td><td>{entity}</td><td>{description}</td></tr>"
+        )
 
     return (
-        "<table class='results'>"
-        "<thead><tr><th>Change / Action</th><th>User</th><th>Date / Time</th></tr></thead>"
+        summary
+        + "<table class='results'>"
+        "<thead><tr>"
+        "<th>Timestamp</th><th>Event Type</th><th>Component</th><th>Entity</th><th>Description</th>"
+        "</tr></thead>"
         "<tbody>" + "".join(body_rows) + "</tbody>"
         "</table>"
     )
@@ -1107,6 +1174,9 @@ tr.band td{background:#e8ecf5;font-weight:700;color:#16213e;padding:6px 10px}
 .vcard-title.learn{color:#0f3460}
 .vcard-title.alarm{color:#fd7e14}
 .vcard-title.block{color:#dc3545}
+/* ---- Audit log ---------------------------------------------------------- */
+.error-box{background:#f8d7da;border:1px solid #f5c6cb;border-radius:4px;color:#721c24;padding:10px 14px;margin:8px 0}
+.audit-summary{font-size:13px;color:#444;margin:4px 0 8px}
 /* ---- Misc --------------------------------------------------------------- */
 .muted{color:#5f6570}
 code{font-family:ui-monospace,Menlo,Consolas,monospace}

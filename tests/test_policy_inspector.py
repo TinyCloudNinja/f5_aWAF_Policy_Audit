@@ -48,12 +48,46 @@ _SIG_SETS_RESP = {
     ]
 }
 
-_AUDIT_RESP = {
-    "items": [
-        {"action": "modify", "username": "admin", "lastUpdateMicros": "1716214331000000", "entityName": "my_waf", "entityType": "security"},
-        {"action": "create", "username": "bob",   "lastUpdateMicros": "1716200000000000", "entityName": "my_waf", "entityType": "policy"},
-    ]
-}
+# Audit items use the new REST API fields (eventType not action)
+_AUDIT_ITEMS = [
+    {
+        "eventType":        "modify",
+        "username":         "admin",
+        "lastUpdateMicros": "1716214331000000",
+        "entityName":       "my_waf",
+        "component":        "policy",
+        "description":      "Policy modified",
+        "deviceName":       "bigip01",
+        "id":               "1",
+    },
+    {
+        "eventType":        "create",
+        "username":         "bob",
+        "lastUpdateMicros": "1716200000000000",
+        "entityName":       "my_waf",
+        "component":        "signature",
+        "description":      "Signature added",
+        "deviceName":       "bigip01",
+        "id":               "2",
+    },
+]
+
+
+def _audit_handler(items):
+    """Return a callable that mocks the audit-logs OData endpoint.
+
+    Responds to the two call types used by _fetch_audit:
+      1. ?$select=totalItems  → {"totalItems": N}
+      2. ?$top=...&$skip=...  → {"items": [...]}
+    """
+    def _handler(path, params=None):
+        params = params or {}
+        if params.get("$select") == "totalItems":
+            return {"totalItems": len(items)}
+        skip = int(params.get("$skip", 0))
+        top  = int(params.get("$top", 25))
+        return {"items": items[skip: skip + top]}
+    return _handler
 
 
 def _make_client(responses: dict) -> MagicMock:
@@ -77,10 +111,10 @@ def _make_client(responses: dict) -> MagicMock:
 
 def _default_client() -> MagicMock:
     return _make_client({
-        "/mgmt/tm/asm/policies/abc123":                   _CORE_RESP,
-        "/mgmt/tm/asm/policies/abc123/blocking-settings": _VIOLATIONS_RESP,
-        "/mgmt/tm/asm/policies/abc123/signature-sets":    _SIG_SETS_RESP,
-        "/mgmt/tm/asm/audit":                             _AUDIT_RESP,
+        "/mgmt/tm/asm/policies/abc123/audit-logs":         _audit_handler(_AUDIT_ITEMS),
+        "/mgmt/tm/asm/policies/abc123":                    _CORE_RESP,
+        "/mgmt/tm/asm/policies/abc123/blocking-settings":  _VIOLATIONS_RESP,
+        "/mgmt/tm/asm/policies/abc123/signature-sets":     _SIG_SETS_RESP,
     })
 
 
@@ -122,28 +156,42 @@ class TestNormalizeLearningMode:
 class TestFormatAuditEntry:
     def test_timestamp_conversion(self):
         entry = _format_audit_entry({
-            "action": "modify",
+            "eventType": "modify",
             "username": "admin",
             "lastUpdateMicros": "1716214331000000",
         })
-        assert entry["timestamp"] == "2024-05-20T14:12:11Z"
+        assert entry["timestamp"] == "2024-05-20 14:12:11 UTC"
 
     def test_zero_micros(self):
-        entry = _format_audit_entry({"action": "x", "username": "y", "lastUpdateMicros": 0})
-        assert entry["timestamp"] == "1970-01-01T00:00:00Z"
+        entry = _format_audit_entry({"lastUpdateMicros": 0})
+        assert entry["timestamp"] == "1970-01-01 00:00:00 UTC"
 
     def test_invalid_micros_returns_empty_string(self):
         entry = _format_audit_entry({"lastUpdateMicros": "not-a-number"})
         assert entry["timestamp"] == ""
 
-    def test_action_and_username_preserved(self):
+    def test_new_fields_preserved(self):
         entry = _format_audit_entry({
-            "action": "create",
-            "username": "alice",
+            "eventType":   "create",
+            "username":    "alice",
+            "component":   "policy",
+            "entityName":  "my_policy",
+            "description": "Created policy",
             "lastUpdateMicros": 1_000_000,
         })
-        assert entry["action"] == "create"
+        assert entry["eventType"] == "create"
         assert entry["username"] == "alice"
+        assert entry["component"] == "policy"
+        assert entry["entityName"] == "my_policy"
+        assert entry["description"] == "Created policy"
+
+    def test_missing_fields_default_to_empty_string(self):
+        entry = _format_audit_entry({"lastUpdateMicros": 1_000_000})
+        assert entry["eventType"] == ""
+        assert entry["component"] == ""
+        assert entry["entityName"] == ""
+        assert entry["description"] == ""
+        assert entry["username"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -308,104 +356,97 @@ class TestFetchSignatureSets:
 
 
 # ---------------------------------------------------------------------------
-# PolicyInspector._fetch_audit — filter path and fallback path
+# PolicyInspector._fetch_audit — paginated OData implementation
 # ---------------------------------------------------------------------------
 
 class TestFetchAudit:
-    def test_primary_filter_path_returns_entries(self):
-        inspector = PolicyInspector(_default_client())
-        entries, errors = inspector._fetch_audit("my_waf")
-        assert len(entries) == 2
+    def _inspector_for(self, items):
+        client = _make_client({
+            "/mgmt/tm/asm/policies/abc123/audit-logs": _audit_handler(items),
+        })
+        return PolicyInspector(client)
+
+    def test_returns_items_and_total(self):
+        inspector = self._inspector_for(_AUDIT_ITEMS)
+        items, total, error, errors = inspector._fetch_audit("abc123")
+        assert len(items) == 2
+        assert total == 2
+        assert error is None
         assert errors == []
 
-    def test_timestamp_converted_in_entries(self):
-        inspector = PolicyInspector(_default_client())
-        entries, errors = inspector._fetch_audit("my_waf")
-        assert entries[0]["timestamp"] == "2024-05-20T14:12:11Z"
+    def test_timestamp_format(self):
+        inspector = self._inspector_for(_AUDIT_ITEMS)
+        items, total, error, errors = inspector._fetch_audit("abc123")
+        assert items[0]["timestamp"] == "2024-05-20 14:12:11 UTC"
 
-    def test_fallback_path_when_filter_rejected(self):
-        """When the $filter-based call raises, the fallback must be used."""
-        call_count = 0
+    def test_new_fields_in_formatted_entries(self):
+        inspector = self._inspector_for(_AUDIT_ITEMS)
+        items, total, error, errors = inspector._fetch_audit("abc123")
+        assert items[0]["eventType"] == "modify"
+        assert items[0]["username"] == "admin"
+        assert items[0]["component"] == "policy"
+        assert items[0]["entityName"] == "my_waf"
 
-        def _get(path, params=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                # First call (with $filter) — simulate rejection
-                raise Exception("400 Bad Request: unsupported filter")
-            # Second call (fallback, no filter)
-            return {
-                "items": [
-                    {
-                        "action":             "modify",
-                        "username":           "admin",
-                        "lastUpdateMicros":   "1716214331000000",
-                        "entityName":         "my_waf",
-                        "entityType":         "security",
-                    },
-                    {
-                        "action":             "create",
-                        "username":           "other",
-                        "lastUpdateMicros":   "1716200000000000",
-                        "entityName":         "other_policy",
-                        "entityType":         "security",
-                    },
-                ]
-            }
-
-        client = MagicMock()
-        client.get.side_effect = _get
-        inspector = PolicyInspector(client)
-        entries, errors = inspector._fetch_audit("my_waf")
-
-        # Client-side filter should keep only the my_waf entry
-        assert len(entries) == 1
-        assert entries[0]["username"] == "admin"
+    def test_empty_policy_returns_zero(self):
+        inspector = self._inspector_for([])
+        items, total, error, errors = inspector._fetch_audit("abc123")
+        assert items == []
+        assert total == 0
+        assert error is None
         assert errors == []
 
-    def test_fallback_filters_by_entity_name(self):
-        """Fallback must drop entries whose entityName != policy_name."""
-        def _get(path, params=None):
-            if params and "$filter" in params:
-                raise Exception("not supported")
-            return {
-                "items": [
-                    {"action": "x", "username": "u", "lastUpdateMicros": "1000000",
-                     "entityName": "other", "entityType": "security"},
-                    {"action": "y", "username": "v", "lastUpdateMicros": "2000000",
-                     "entityName": "my_waf", "entityType": "policy"},
-                ]
-            }
+    def test_no_policy_id_returns_error(self):
+        inspector = PolicyInspector(MagicMock())
+        items, total, error, errors = inspector._fetch_audit("")
+        assert items == []
+        assert total == 0
+        assert errors != []
 
-        client = MagicMock()
-        client.get.side_effect = _get
-        inspector = PolicyInspector(client, audit_limit=10)
-        entries, errors = inspector._fetch_audit("my_waf")
-        assert len(entries) == 1
-        assert entries[0]["username"] == "v"
-
-    def test_both_paths_fail_yields_error(self):
+    def test_count_call_failure_returns_error(self):
         client = MagicMock()
         client.get.side_effect = Exception("network down")
         inspector = PolicyInspector(client)
-        entries, errors = inspector._fetch_audit("my_waf")
-        assert entries == []
+        items, total, error, errors = inspector._fetch_audit("abc123")
+        assert items == []
+        assert total == 0
+        assert error is not None
+        assert "audit" in error
         assert len(errors) == 1
-        assert "audit:" in errors[0]
 
-    def test_audit_limit_respected(self):
+    def test_page_call_failure_returns_partial_results_and_error(self):
+        """Count succeeds with N>0; first page GET fails — returns partial + error."""
+        call_num = [0]
+
+        def _get(path, params=None):
+            call_num[0] += 1
+            if call_num[0] == 1:
+                return {"totalItems": 5}
+            raise Exception("500 Internal Server Error")
+
+        client = MagicMock()
+        client.get.side_effect = _get
+        inspector = PolicyInspector(client)
+        items, total, error, errors = inspector._fetch_audit("abc123")
+        assert total == 5
+        assert error is not None
+        assert len(errors) == 1
+
+    def test_pagination_fetches_multiple_pages(self):
+        """25+ items trigger a second page fetch."""
         many_items = [
             {
-                "action": "modify", "username": "u",
+                "eventType": "modify", "username": "u",
                 "lastUpdateMicros": str(i * 1_000_000),
-                "entityName": "my_waf", "entityType": "security",
+                "entityName": "pol", "component": "c",
+                "description": f"item {i}", "deviceName": "d", "id": str(i),
             }
-            for i in range(20)
+            for i in range(30)
         ]
-        client = _make_client({"/mgmt/tm/asm/audit": {"items": many_items}})
-        inspector = PolicyInspector(client, audit_limit=5)
-        entries, errors = inspector._fetch_audit("my_waf")
-        assert len(entries) == 5
+        inspector = self._inspector_for(many_items)
+        items, total, error, errors = inspector._fetch_audit("abc123")
+        assert total == 30
+        assert len(items) == 30
+        assert error is None
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +466,8 @@ class TestInspectOne:
         assert isinstance(result["violations"]["learn"], list)
         assert isinstance(result["signatureSets"], list)
         assert isinstance(result["auditLog"], list)
+        assert isinstance(result["auditLogTotal"], int)
+        assert result["auditLogError"] is None
         assert result["errors"] == []
 
     def test_partial_failure_recorded_in_errors(self):
@@ -436,12 +479,12 @@ class TestInspectOne:
             call_count += 1
             if "blocking-settings" in path:
                 raise Exception("503 Service Unavailable")
+            if "audit-logs" in path:
+                return _audit_handler(_AUDIT_ITEMS)(path, params)
             if path.startswith("/mgmt/tm/asm/policies/abc123") and "signature" not in path:
                 return _CORE_RESP
             if "signature-sets" in path:
                 return _SIG_SETS_RESP
-            if "/mgmt/tm/asm/audit" in path:
-                return _AUDIT_RESP
             raise AssertionError(f"Unexpected GET {path}")
 
         client = MagicMock()
@@ -463,7 +506,8 @@ class TestInspectOne:
         result = inspector.inspect_one(_POLICY)
 
         for key in ("name", "fullPath", "partition", "enforcementMode",
-                    "learningMode", "violations", "signatureSets", "auditLog", "errors"):
+                    "learningMode", "violations", "signatureSets",
+                    "auditLog", "auditLogTotal", "auditLogError", "errors"):
             assert key in result
 
 
@@ -477,12 +521,6 @@ class TestInspectAll:
             {**_POLICY, "id": "p1", "name": "waf1", "fullPath": "/Common/waf1"},
             {**_POLICY, "id": "p2", "name": "waf2", "fullPath": "/Common/waf2"},
         ]
-        # All GETs return empty/default responses
-        client = _make_client({
-            "/mgmt/tm/asm/policies/p1": _CORE_RESP,
-            "/mgmt/tm/asm/policies/p2": _CORE_RESP,
-            "/mgmt/tm/asm/audit": {"items": []},
-        })
 
         def _get(path, params=None):
             for prefix, resp in {
@@ -493,7 +531,8 @@ class TestInspectAll:
                     if "blocking-settings" in path or "signature-sets" in path:
                         return {"items": []}
                     return resp
-            return {"items": []}
+            # Audit-logs: return empty (totalItems=0 → no further pages)
+            return {"items": [], "totalItems": 0}
 
         client = MagicMock()
         client.get.side_effect = _get
@@ -517,7 +556,7 @@ class TestInspectAll:
             client = MagicMock()
             client.get.side_effect = lambda path, params=None: (
                 _CORE_RESP if path.startswith("/mgmt/tm/asm/policies/good")
-                else {"items": []}
+                else {"items": [], "totalItems": 0}
             )
             inspector = PolicyInspector(client, concurrent=2)
             results = inspector.inspect_all([good_policy, bad_policy])
