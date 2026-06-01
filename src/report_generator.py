@@ -997,45 +997,7 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
 
     tbody: List[str] = []
 
-    # Bucket A — active on policy, not in baseline
-    tbody.append(_bucket_hdr(
-        "Violations Active on Policy — Not in Baseline", len(bucket_a), "#e67e22"
-    ))
-    if bucket_a:
-        for v in bucket_a:
-            tbody.append(
-                "<tr>"
-                f"<td>{_esc(_format_violation_name(v, _canonical(v)))}</td>"
-                f"<td>{_esc(_fmt_setting(v.get('learn')))}</td>"
-                f"<td>{_esc(_fmt_setting(v.get('alarm')))}</td>"
-                f"<td>{_esc(_fmt_setting(v.get('block')))}</td>"
-                f"<td>{EM}</td><td>{EM}</td><td>{EM}</td>"
-                "<td style='color:#e67e22;font-weight:bold'>+ Added</td>"
-                "</tr>"
-            )
-    else:
-        tbody.append(_none_row())
-
-    # Bucket B — matching baseline
-    tbody.append(_bucket_hdr("Violations Matching Baseline", len(bucket_b), "#27ae60"))
-    if bucket_b:
-        for v, b in bucket_b:
-            tbody.append(
-                "<tr>"
-                f"<td>{_esc(_format_violation_name(v, _canonical(v)))}</td>"
-                f"<td>{_esc(_fmt_setting(v.get('learn')))}</td>"
-                f"<td>{_esc(_fmt_setting(v.get('alarm')))}</td>"
-                f"<td>{_esc(_fmt_setting(v.get('block')))}</td>"
-                f"<td>{_esc(_fmt_setting(b.get('learn')))}</td>"
-                f"<td>{_esc(_fmt_setting(b.get('alarm')))}</td>"
-                f"<td>{_esc(_fmt_setting(b.get('block')))}</td>"
-                "<td style='color:#27ae60;font-weight:bold'>&#10003; Match</td>"
-                "</tr>"
-            )
-    else:
-        tbody.append(_none_row())
-
-    # Bucket C — drift (differs from baseline)
+    # Bucket C — drift (differs from baseline) — shown first
     tbody.append(_bucket_hdr("Violations Differing from Baseline", len(bucket_c), "#c0392b"))
     if bucket_c:
         for v, b in bucket_c:
@@ -1052,6 +1014,25 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
                 + _cell(b.get("alarm"), alarm_diff)
                 + _cell(b.get("block"), block_diff)
                 + "<td style='color:#e67e22;font-weight:bold'>&#9888; Drift</td>"
+                "</tr>"
+            )
+    else:
+        tbody.append(_none_row())
+
+    # Bucket A — active on policy, not in baseline
+    tbody.append(_bucket_hdr(
+        "Violations Active on Policy — Not in Baseline", len(bucket_a), "#e67e22"
+    ))
+    if bucket_a:
+        for v in bucket_a:
+            tbody.append(
+                "<tr>"
+                f"<td>{_esc(_format_violation_name(v, _canonical(v)))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('learn')))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('alarm')))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('block')))}</td>"
+                f"<td>{EM}</td><td>{EM}</td><td>{EM}</td>"
+                "<td style='color:#e67e22;font-weight:bold'>+ Added</td>"
                 "</tr>"
             )
     else:
@@ -1086,6 +1067,43 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
         "</table>"
     )
 
+    # Bucket B — matching baseline (collapsed by default)
+    b_rows = []
+    if bucket_b:
+        for v, b in bucket_b:
+            b_rows.append(
+                "<tr>"
+                f"<td>{_esc(_format_violation_name(v, _canonical(v)))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('learn')))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('alarm')))}</td>"
+                f"<td>{_esc(_fmt_setting(v.get('block')))}</td>"
+                f"<td>{_esc(_fmt_setting(b.get('learn')))}</td>"
+                f"<td>{_esc(_fmt_setting(b.get('alarm')))}</td>"
+                f"<td>{_esc(_fmt_setting(b.get('block')))}</td>"
+                "<td style='color:#27ae60;font-weight:bold'>&#10003; Match</td>"
+                "</tr>"
+            )
+        b_inner = (
+            "<table class='results violation-vs-baseline'>"
+            "<thead><tr>"
+            "<th>Violation Name</th><th>Learn</th><th>Alarm</th><th>Block</th>"
+            "<th>Baseline Learn</th><th>Baseline Alarm</th><th>Baseline Block</th><th>Status</th>"
+            "</tr></thead>"
+            "<tbody>" + "".join(b_rows) + "</tbody></table>"
+        )
+    else:
+        b_inner = "<p class='muted' style='font-style:italic;padding:6px 0'>None</p>"
+
+    match_block = (
+        "<details style='margin-top:12px'>"
+        "<summary style='background:#27ae60;color:#fff;font-weight:bold;"
+        "padding:8px 10px;cursor:pointer;list-style:none'>"
+        f"&#9654; Violations Matching Baseline ({len(bucket_b)}) &#8212; click to expand"
+        "</summary>"
+        f"<div style='padding:8px 0'>{b_inner}</div>"
+        "</details>"
+    )
+
     # Bucket E — out of scope (collapsed by default)
     if bucket_e:
         e_rows = [
@@ -1110,7 +1128,7 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
         "</details>"
     )
 
-    return main_table + scope_block
+    return main_table + match_block + scope_block
 
 
 def _learning_mode_badge(mode: str) -> str:
