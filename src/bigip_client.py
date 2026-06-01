@@ -171,6 +171,29 @@ class BigIPClient:
         resp = self._request("GET", path, params=params)
         return resp.json()
 
+    def get_all(self, path: str, params: Optional[Dict] = None) -> list:
+        """Fetch all pages from a paged iControl REST collection.
+
+        Uses $top/$skip OData pagination until totalItems is exhausted.
+        Raises on HTTP errors; returns an empty list for empty collections.
+        """
+        params = dict(params or {})
+        params.setdefault("$top", 500)
+        items: list = []
+        skip = 0
+        while True:
+            params["$skip"] = skip
+            data = self.get(path, params=params)
+            page = data.get("items", [])
+            items.extend(page)
+            total = data.get("totalItems", len(items))
+            if len(items) >= total:
+                break
+            skip += len(page)
+            if not page:
+                break  # safety: prevent infinite loop on empty page response
+        return items
+
     def post(self, path: str, data: Optional[Dict] = None) -> Any:
         resp = self._request("POST", path, json=data)
         return resp.json()
