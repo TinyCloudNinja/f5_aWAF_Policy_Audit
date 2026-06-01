@@ -314,6 +314,8 @@ def generate_html_dashboard(
                 virtual_server_inventory=virtual_server_inventory or [],
                 inventory_error=virtual_server_inventory_error,
                 policy_path_to_id=policy_path_to_id,
+                policy_score_map={str(r.policy_path): r for r in ordered},
+                tier_counts=counts,
             )
             if not is_bot
             else (
@@ -423,42 +425,68 @@ def generate_html_dashboard(
         "var viewId=policyPathMap[path];"
         "if(viewId){showView(viewId);}"
         "});"
-        "document.addEventListener('click', function(ev){"
-        "var btn=ev.target.closest('.vs-toggle');"
-        "if(!btn){return;}"
-        "var rowId=btn.getAttribute('data-row-id');"
-        "var detailRow=document.getElementById('vs-detail-'+rowId);"
-        "if(!detailRow){return;}"
-        "var expanded=btn.getAttribute('aria-expanded')==='true';"
-        "btn.setAttribute('aria-expanded', expanded?'false':'true');"
-        "btn.textContent=expanded?'+':'\\u2212';"
-        "detailRow.hidden=expanded;"
-        "});"
         "var filterInput=document.getElementById('vs-filter');"
-        "if(filterInput){filterInput.addEventListener('input', function(){"
+        "if(filterInput){filterInput.addEventListener('input',function(){"
         "var q=(filterInput.value||'').toLowerCase();"
         "document.querySelectorAll('#vs-summary-body tr.vs-row').forEach(function(row){"
         "var show=(row.getAttribute('data-search')||'').toLowerCase().indexOf(q)!==-1;"
         "row.style.display=show?'':'none';"
-        "var rid=row.getAttribute('data-row-id');"
-        "var dr=document.getElementById('vs-detail-'+rid);"
-        "if(dr&&!show){dr.hidden=true;}"
         "});"
         "});}"
-        "document.querySelectorAll('.sort-btn').forEach(function(btn){btn.addEventListener('click', function(){"
+        "document.querySelectorAll('.sort-btn').forEach(function(btn){btn.addEventListener('click',function(){"
         "var col=btn.getAttribute('data-col');"
-        "var body=document.getElementById('vs-summary-body'); if(!body){return;}"
+        "var body=document.getElementById('vs-summary-body');if(!body){return;}"
         "var rows=Array.prototype.slice.call(body.querySelectorAll('tr.vs-row'));"
         "var asc=btn.getAttribute('data-asc')!=='true';"
         "btn.setAttribute('data-asc',asc?'true':'false');"
         "rows.sort(function(a,b){"
         "var av=(a.getAttribute('data-'+col)||'').toLowerCase();"
         "var bv=(b.getAttribute('data-'+col)||'').toLowerCase();"
-        "if(col==='attached'){var an=parseInt(av||'0',10),bn=parseInt(bv||'0',10); return asc?an-bn:bn-an;}"
+        "if(col==='score'||col==='tier'){var an=parseInt(av||'-1',10),bn=parseInt(bv||'-1',10);return asc?an-bn:bn-an;}"
         "return asc?av.localeCompare(bv):bv.localeCompare(av);"
         "});"
-        "rows.forEach(function(r){body.appendChild(r); var rid=r.getAttribute('data-row-id'); var dr=document.getElementById('vs-detail-'+rid); if(dr){body.appendChild(dr);}});"
+        "rows.forEach(function(r){body.appendChild(r);});"
         "});});"
+        "function exportMappingCSV(){"
+        "var table=document.getElementById('vs-summary-table');if(!table){return;}"
+        "var rows=Array.prototype.slice.call(table.querySelectorAll('tr'));"
+        "var csv=rows.map(function(row){"
+        "var cells=Array.prototype.slice.call(row.querySelectorAll('th,td'));"
+        "return cells.map(function(cell){"
+        "var t=(cell.textContent||'').replace(/\\s+/g,' ').trim();"
+        "return '\\x22'+t.split('\\x22').join('\\x22\\x22')+'\\x22';"
+        "}).join(',');"
+        "}).join('\\n');"
+        "var blob=new Blob([csv],{type:'text/csv'});"
+        "var url=URL.createObjectURL(blob);"
+        "var a=document.createElement('a');"
+        "a.href=url;a.download='waf_policy_mapping.csv';"
+        "document.body.appendChild(a);a.click();document.body.removeChild(a);"
+        "URL.revokeObjectURL(url);"
+        "}"
+        "function copyMappingToClipboard(){"
+        "var table=document.getElementById('vs-summary-table');if(!table){return;}"
+        "var rows=Array.prototype.slice.call(table.querySelectorAll('tr'));"
+        "var tsv=rows.map(function(row){"
+        "var cells=Array.prototype.slice.call(row.querySelectorAll('th,td'));"
+        "return cells.map(function(cell){"
+        "return (cell.textContent||'').replace(/\\s+/g,' ').trim().replace(/\\t/g,' ');"
+        "}).join('\\t');"
+        "}).join('\\n');"
+        "var copyBtn=document.getElementById('copy-table-btn');"
+        "function setCopyDone(){if(copyBtn){copyBtn.textContent='\\u2713 Copied!';setTimeout(function(){copyBtn.textContent='Copy to Clipboard';},2000);}}"
+        "if(navigator.clipboard&&navigator.clipboard.writeText){"
+        "navigator.clipboard.writeText(tsv).then(setCopyDone).catch(function(){"
+        "var ta=document.createElement('textarea');ta.value=tsv;"
+        "document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);"
+        "setCopyDone();"
+        "});"
+        "}else{"
+        "var ta=document.createElement('textarea');ta.value=tsv;"
+        "document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);"
+        "setCopyDone();"
+        "}"
+        "}"
         "showView('summary-view');"
         "})();"
         "</script>"
@@ -474,6 +502,8 @@ def _build_virtual_server_summary_section(
     virtual_server_inventory: List[VirtualServerRecord],
     inventory_error: Optional[str],
     policy_path_to_id: Dict[str, str],
+    policy_score_map: Optional[Dict[str, Any]] = None,
+    tier_counts: Optional[Dict[str, int]] = None,
 ) -> str:
     def _status_meta(status: str) -> tuple[str, str]:
         if status == "enabled":
@@ -491,9 +521,12 @@ def _build_virtual_server_summary_section(
             "</div>"
         )
 
+    score_map = policy_score_map or {}
     records = virtual_server_inventory or []
-    rows: List[str] = []
-    for idx, rec in enumerate(records):
+    html_rows: List[str] = []
+    _TIER_ORDER = {TIER_RED: 0, TIER_AMBER: 1, TIER_YELLOW: 2, TIER_GREEN: 3}
+
+    for rec in records:
         source: Any = asdict(rec) if is_dataclass(rec) else rec
         if not isinstance(source, dict):
             continue
@@ -502,118 +535,143 @@ def _build_virtual_server_summary_section(
         partition = str(source.get("partition") or "")
         destination = str(source.get("destination") or "—")
         http_profile = str(source.get("http_profile") or "—")
-        direct = list(source.get("directly_attached_waf_policies") or [])
-        ltm_policies = list(source.get("ltm_policies") or [])
-        ltm_rule_count = sum(len((p or {}).get("rules") or []) for p in ltm_policies if isinstance(p, dict))
-        total_policies = len(direct) + ltm_rule_count
         status_raw = str(source.get("waf_status") or "not_applicable")
+        direct = list(source.get("directly_attached_waf_policies") or [])
+        ltm_policies_src = list(source.get("ltm_policies") or [])
         status_label, status_cls = _status_meta(status_raw)
-        has_expand = status_raw == "enabled" and total_policies > 0
 
-        search_blob = " ".join([name, partition, destination, http_profile, status_label] + [str(p) for p in direct])
-        attached_label = str(total_policies) if total_policies else "—"
-
-        toggle_html = (
-            f"<button type='button' class='vs-toggle' aria-expanded='false' data-row-id='{idx}' title='Toggle details'>+</button>"
-            if has_expand else ""
-        )
-
-        rows.append(
-            "<tr class='vs-row'"
-            f" data-row-id='{idx}'"
-            f" data-search='{_esc(search_blob)}'"
-            f" data-name='{_esc(name)}'"
-            f" data-partition='{_esc(partition)}'"
-            f" data-destination='{_esc(destination)}'"
-            f" data-http_profile='{_esc(http_profile)}'"
-            f" data-status='{_esc(status_label)}'"
-            f" data-attached='{total_policies}'>"
-            f"<td class='expand-col'>{toggle_html}</td>"
-            f"<td>{_esc(name)}</td>"
-            f"<td>{_esc(partition)}</td>"
-            f"<td>{_esc(destination)}</td>"
-            f"<td>{_esc(http_profile)}</td>"
-            f"<td><span class='status-badge {status_cls}'>{_esc(status_label)}</span></td>"
-            f"<td>{_esc(attached_label)}</td>"
-            "</tr>"
-        )
-
-        if has_expand:
-            direct_lines = []
-            for pol in direct:
-                p = str(pol)
-                if p in policy_path_to_id:
-                    direct_lines.append(f"<li><a href='#' class='policy-jump' data-policy-path='{_esc(p)}'>{_esc(p)}</a></li>")
-                else:
-                    direct_lines.append(f"<li>{_esc(p)}</li>")
-            direct_html = "<ul>" + ("".join(direct_lines) if direct_lines else "<li>None</li>") + "</ul>"
-
-            routed_rows: List[str] = []
-            for policy in ltm_policies:
-                if not isinstance(policy, dict):
+        # Build flat list of (attach_type, ltm_name, rule_name, hosts_str, waf_policy)
+        attachments: List[tuple] = []
+        for pol_path in direct:
+            attachments.append(("Direct", "—", "—", "—", str(pol_path)))
+        for ltm_pol in ltm_policies_src:
+            if not isinstance(ltm_pol, dict):
+                continue
+            ltm_name = str(ltm_pol.get("full_path") or ltm_pol.get("name") or "(unresolved)")
+            for rule in (ltm_pol.get("rules") or []):
+                if not isinstance(rule, dict):
                     continue
-                ltm_name = str(policy.get("full_path") or policy.get("name") or "(unresolved)")
-                for rule in (policy.get("rules") or []):
-                    if not isinstance(rule, dict):
-                        continue
-                    waf_policy = str(rule.get("waf_policy") or "(unresolved)")
-                    if waf_policy in policy_path_to_id:
-                        waf_cell = f"<a href='#' class='policy-jump' data-policy-path='{_esc(waf_policy)}'>{_esc(waf_policy)}</a>"
-                    else:
-                        waf_cell = _esc(waf_policy)
-                    host_conditions = rule.get("host_conditions") or ["(any)"]
-                    for host in host_conditions:
-                        routed_rows.append(
-                            "<tr>"
-                            f"<td>{_esc(host)}</td>"
-                            f"<td>{_esc(ltm_name)}</td>"
-                            f"<td>{_esc(rule.get('rule_name') or '(unnamed rule)')}</td>"
-                            f"<td>{waf_cell}</td>"
-                            "</tr>"
-                        )
+                rule_name = str(rule.get("rule_name") or "(unnamed rule)")
+                waf_policy = str(rule.get("waf_policy") or "(unresolved)")
+                hosts = rule.get("host_conditions") or ["(any)"]
+                hosts_str = ", ".join(str(h) for h in hosts)
+                attachments.append(("LTM", ltm_name, rule_name, hosts_str, waf_policy))
 
-            routed_html = (
-                "<table class='results nested'>"
-                "<thead><tr><th>Host (FQDN)</th><th>LTM Policy</th><th>Rule</th><th>WAF Policy</th></tr></thead>"
-                f"<tbody>{''.join(routed_rows) if routed_rows else '<tr><td colspan=4>None</td></tr>'}</tbody>"
-                "</table>"
+        if not attachments:
+            attachments.append((None, "—", "—", "—", "—"))
+
+        for (attach_type, ltm_name, rule_name, hosts_str, waf_policy) in attachments:
+            result = score_map.get(waf_policy) if (waf_policy and waf_policy != "—") else None
+            tier_label = result.tier_label if result else "—"
+            tier_cls = _TIER_CLASS.get(result.tier, "") if result else ""
+            tier_emoji = _TIER_EMOJI.get(result.tier, "") if result else ""
+            score_str = f"{result.score:.1f}" if result else "—"
+            score_num = str(int(result.score * 10)) if result else "-1"
+            tier_order = str(_TIER_ORDER.get(result.tier, 4)) if result else "5"
+
+            if attach_type is None:
+                attach_display = "—"
+                attach_sort = ""
+            elif attach_type == "Direct":
+                attach_display = "<span class='attach-direct'>Direct</span>"
+                attach_sort = "direct"
+            else:
+                attach_display = (
+                    f"<span class='attach-ltm' title='{_esc(ltm_name)}'>{_esc(ltm_name)}</span>"
+                )
+                attach_sort = ltm_name.lower()
+
+            if waf_policy != "—" and waf_policy in policy_path_to_id:
+                policy_display = (
+                    f"<a href='#' class='policy-jump' data-policy-path='{_esc(waf_policy)}'>{_esc(waf_policy)}</a>"
+                )
+            else:
+                policy_display = _esc(waf_policy)
+
+            tier_badge = (
+                f"<span class='tier-badge {tier_cls}'>{tier_emoji} {_esc(tier_label)}</span>"
+                if result else "<span class='tier-badge'>—</span>"
             )
 
-            rows.append(
-                f"<tr id='vs-detail-{idx}' class='vs-detail-row' hidden>"
-                "<td colspan='7'>"
-                "<div class='vs-detail-panel'>"
-                "<h4>Direct attachments</h4>"
-                f"{direct_html}"
-                "<h4>LTM-Policy-routed attachments</h4>"
-                f"{routed_html}"
-                "</div>"
-                "</td></tr>"
+            rule_cell = (
+                f"{_esc(rule_name)}<br><small class='muted'>{_esc(hosts_str)}</small>"
+                if (attach_type == "LTM" and rule_name not in ("—", ""))
+                else "—"
             )
+
+            search_blob = " ".join([
+                name, partition, destination, http_profile,
+                status_label, waf_policy, ltm_name, tier_label,
+            ])
+
+            html_rows.append(
+                "<tr class='vs-row'"
+                f" data-search='{_esc(search_blob)}'"
+                f" data-name='{_esc(name)}'"
+                f" data-partition='{_esc(partition)}'"
+                f" data-destination='{_esc(destination)}'"
+                f" data-http_profile='{_esc(http_profile)}'"
+                f" data-status='{_esc(status_label)}'"
+                f" data-attachment='{_esc(attach_sort)}'"
+                f" data-policy='{_esc(waf_policy)}'"
+                f" data-tier='{tier_order}'"
+                f" data-score='{score_num}'>"
+                f"<td>{_esc(name)}</td>"
+                f"<td>{_esc(partition)}</td>"
+                f"<td>{_esc(destination)}</td>"
+                f"<td>{_esc(http_profile)}</td>"
+                f"<td><span class='status-badge {status_cls}'>{_esc(status_label)}</span></td>"
+                f"<td>{attach_display}</td>"
+                f"<td>{rule_cell}</td>"
+                f"<td>{policy_display}</td>"
+                f"<td>{tier_badge}</td>"
+                f"<td class='score-cell'>{_esc(score_str)}</td>"
+                "</tr>"
+            )
+
+    tc = tier_counts or {}
+    tier_bar_html = (
+        "<div class='summary-bar'>"
+        f"<span class='tier-red'>&#128308; Red: {tc.get(TIER_RED, 0)}</span>"
+        f"<span class='tier-amber'>&#128992; Amber: {tc.get(TIER_AMBER, 0)}</span>"
+        f"<span class='tier-yellow'>&#128993; Yellow: {tc.get(TIER_YELLOW, 0)}</span>"
+        f"<span class='tier-green'>&#128994; Green: {tc.get(TIER_GREEN, 0)}</span>"
+        "</div>"
+    ) if tc else ""
 
     return (
         "<h1>WAF Audit Summary</h1>"
+        + tier_bar_html
+        + "<h2 class='sec-h2'>Virtual Server &#8212; WAF Policy Mapping</h2>"
         "<div class='pb-banner pb-manual'>"
         "<span class='g'>&#9888;</span>"
-        "<span>Virtual Server inventory is read-only and reflects ASM/AWAF applicability at audit time. "
-        "Expand a row to see policy attachments.</span>"
+        "<span>Virtual Server inventory reflects ASM/AWAF applicability at audit time. "
+        "Each row is one WAF policy attachment per virtual server. "
+        "Use <strong>Export CSV</strong> or <strong>Copy to Clipboard</strong> to paste into a spreadsheet.</span>"
         "</div>"
-        "<h2 class='sec-h2'>Virtual Server Summary</h2>"
         "<div class='vs-controls'>"
         "<label for='vs-filter'>Filter:</label>"
-        "<input id='vs-filter' type='text' placeholder='Search virtual servers, partitions, destination, or policy'>"
+        "<input id='vs-filter' type='text' placeholder='Search virtual servers, policies, partitions&#8230;'>"
+        "<button type='button' class='export-btn' onclick='exportMappingCSV()'>&#11015; Export CSV</button>"
+        "<button type='button' class='export-btn export-btn-secondary' id='copy-table-btn' "
+        "onclick='copyMappingToClipboard()'>Copy to Clipboard</button>"
         "</div>"
-        "<table id='vs-summary-table' class='results' aria-label='Virtual Server Summary'>"
+        "<table id='vs-summary-table' class='results' aria-label='Virtual Server WAF Policy Mapping'>"
         "<thead><tr>"
-        "<th></th>"
         "<th><button type='button' class='sort-btn' data-col='name'>Virtual Server</button></th>"
         "<th><button type='button' class='sort-btn' data-col='partition'>Partition</button></th>"
         "<th><button type='button' class='sort-btn' data-col='destination'>Destination</button></th>"
         "<th><button type='button' class='sort-btn' data-col='http_profile'>HTTP Profile</button></th>"
         "<th><button type='button' class='sort-btn' data-col='status'>WAF Status</button></th>"
-        "<th><button type='button' class='sort-btn' data-col='attached'>Attached WAF Policies</button></th>"
+        "<th><button type='button' class='sort-btn' data-col='attachment'>Attachment</button></th>"
+        "<th>Rule / Host Conditions</th>"
+        "<th><button type='button' class='sort-btn' data-col='policy'>ASM Policy</button></th>"
+        "<th><button type='button' class='sort-btn' data-col='tier'>Tier</button></th>"
+        "<th><button type='button' class='sort-btn' data-col='score'>Score %</button></th>"
         "</tr></thead>"
-        f"<tbody id='vs-summary-body'>{''.join(rows) if rows else '<tr><td colspan=7>No virtual servers found.</td></tr>'}</tbody>"
+        "<tbody id='vs-summary-body'>"
+        f"{''.join(html_rows) if html_rows else '<tr><td colspan=10>No virtual servers found.</td></tr>'}"
+        "</tbody>"
         "</table>"
     )
 
@@ -1060,9 +1118,9 @@ tr.band td{background:#e8ecf5;font-weight:700;color:#16213e;padding:6px 10px}
 .vs-toggle:hover{background:#e6edf7}
 .vs-detail-row>td{background:#f3f6fc;border-top:2px solid #d9dfea;padding:0}
 .vs-detail-panel{padding:10px 14px}
-.vs-controls{margin:6px 0 10px;display:flex;align-items:center;gap:8px}
-.vs-controls label{font-size:13px;font-weight:600;color:#444}
-.vs-controls input{padding:7px 10px;border:1px solid #d9dfea;border-radius:4px;font-size:13px;width:320px;font-family:inherit}
+.vs-controls{margin:6px 0 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.vs-controls label{font-size:13px;font-weight:600;color:#444;white-space:nowrap}
+.vs-controls input{padding:7px 10px;border:1px solid #d9dfea;border-radius:4px;font-size:13px;flex:1;min-width:180px;max-width:360px;font-family:inherit}
 .sort-btn{background:none;border:none;cursor:pointer;font-weight:700;color:#fff;padding:0;font:inherit;font-size:inherit}
 .sort-btn:hover{text-decoration:underline}
 /* ---- Collapsible sections ----------------------------------------------- */
@@ -1101,6 +1159,23 @@ tr.band td{background:#e8ecf5;font-weight:700;color:#16213e;padding:6px 10px}
 code{font-family:ui-monospace,Menlo,Consolas,monospace}
 .policy-jump{color:#0f3460;cursor:pointer;text-decoration:underline}
 .summary-card{background:#eef5ff}
+/* ---- Export buttons ----------------------------------------------------- */
+.export-btn{padding:6px 14px;background:#0f3460;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:600;transition:background .15s;white-space:nowrap}
+.export-btn:hover{background:#1a4f8a}
+.export-btn-secondary{background:#fff;color:#0f3460;border:1px solid #0f3460}
+.export-btn-secondary:hover{background:#e6edf7}
+/* ---- Tier badge (inline, for table cells) -------------------------------- */
+.tier-badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+.tier-badge.tier-red{background:#dc3545;color:#fff}
+.tier-badge.tier-amber{background:#fd7e14;color:#fff}
+.tier-badge.tier-yellow{background:#ffc107;color:#000}
+.tier-badge.tier-green{background:#28a745;color:#fff}
+.tier-badge:not(.tier-red):not(.tier-amber):not(.tier-yellow):not(.tier-green){background:#e9ecef;color:#495057}
+/* ---- Attachment type tags ------------------------------------------------ */
+.attach-direct{display:inline-block;padding:1px 7px;background:#d4edda;color:#155724;border-radius:4px;font-size:12px;font-weight:600}
+.attach-ltm{display:inline-block;padding:1px 7px;background:#cce5ff;color:#004085;border-radius:4px;font-size:12px;font-weight:600;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
+/* ---- Score cell ---------------------------------------------------------- */
+.score-cell{font-weight:700;font-variant-numeric:tabular-nums;text-align:right}
 """
 
 
