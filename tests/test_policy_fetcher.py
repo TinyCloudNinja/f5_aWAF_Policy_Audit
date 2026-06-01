@@ -152,10 +152,33 @@ class TestNormalizeSignatureSets:
         assert result[0]["name"] == "Generic Detection Signatures"
         assert result[0]["block"] is True
 
-    def test_name_from_reference_link(self):
+    def test_name_resolved_via_global_lookup(self):
+        """Real name is resolved from the global id→name map, not the raw hash ID."""
+        items = [{"signatureSetReference": {
+            "link": "https://host/mgmt/tm/asm/signature-sets/abc123?ver=17.5.1"
+        }}]
+        result = _normalize_signature_sets(items, name_lookup={"abc123": "Generic Detection Signatures"})
+        assert result[0]["name"] == "Generic Detection Signatures"
+
+    def test_ver_query_param_stripped_from_link_id(self):
+        """Without a lookup, falls back to the bare hash ID (no ?ver=... suffix)."""
+        items = [{"signatureSetReference": {
+            "link": "https://host/mgmt/tm/asm/signature-sets/abc123?ver=17.5.1"
+        }}]
+        result = _normalize_signature_sets(items)
+        assert result[0]["name"] == "abc123"
+
+    def test_name_from_reference_link_no_query(self):
         items = [{"signatureSetReference": {"link": "/mgmt/tm/asm/signature-sets/All_Signatures"}}]
         result = _normalize_signature_sets(items)
         assert result[0]["name"] == "All_Signatures"
+
+    def test_explicit_name_takes_priority_over_lookup(self):
+        """When the sub-collection already has a name, skip the global lookup."""
+        items = [{"name": "Already Named", "alarm": False, "block": False, "learn": False,
+                  "signatureSetReference": {"link": ".../abc123"}}]
+        result = _normalize_signature_sets(items, name_lookup={"abc123": "Should Not Appear"})
+        assert result[0]["name"] == "Already Named"
 
 
 class TestNormalizeWhitelistIps:
@@ -317,3 +340,50 @@ class TestFetchWafPolicy:
         fetcher = PolicyFetcher(client)
         result = fetcher.fetch_waf_policy(_make_policy())
         assert result["policy-builder"]["learningMode"] == "automatic"
+
+    def test_signature_sets_resolved_via_global_lookup(self):
+        """Sig-set names must be resolved from /asm/signature-sets, not left as hash IDs."""
+        client = MagicMock()
+        client.get.return_value = {"enforcementMode": "blocking", "policyBuilder": {}}
+
+        def fake_get_all(path, params=None):
+            if path == "/mgmt/tm/asm/signature-sets":
+                return [{"id": "abc123", "name": "Generic Detection Signatures"}]
+            if "signature-sets" in path:
+                # Policy sub-collection: items carry only a reference link, no name
+                return [{"signatureSetReference": {
+                    "link": "https://host/mgmt/tm/asm/signature-sets/abc123?ver=17.5.1"
+                }, "alarm": True, "block": True, "learn": False}]
+            return []
+
+        client.get_all.side_effect = fake_get_all
+        fetcher = PolicyFetcher(client)
+        result = fetcher.fetch_waf_policy(_make_policy())
+        sig_sets = result["signature-sets"]
+        assert len(sig_sets) == 1
+        assert sig_sets[0]["name"] == "Generic Detection Signatures"
+
+
+# ── PolicyFetcher._get_sig_set_names caching ──────────────────────────────────
+
+class TestGetSigSetNamesCache:
+    def test_fetched_once_across_multiple_calls(self):
+        """Global sig-set catalog is fetched exactly once regardless of call count."""
+        client = MagicMock()
+        client.get_all.return_value = [
+            {"id": "id1", "name": "Set One"},
+            {"id": "id2", "name": "Set Two"},
+        ]
+        fetcher = PolicyFetcher(client)
+        r1 = fetcher._get_sig_set_names()
+        r2 = fetcher._get_sig_set_names()
+        assert r1 == r2 == {"id1": "Set One", "id2": "Set Two"}
+        assert client.get_all.call_count == 1
+
+    def test_api_failure_returns_empty_dict(self):
+        """If the global endpoint fails, fall back gracefully (no crash)."""
+        client = MagicMock()
+        client.get_all.side_effect = Exception("connection refused")
+        fetcher = PolicyFetcher(client)
+        result = fetcher._get_sig_set_names()
+        assert result == {}
