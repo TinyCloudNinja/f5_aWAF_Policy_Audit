@@ -154,15 +154,41 @@ class PolicyInspector:
         return {"enforcementMode": enforcement, "learningMode": learning}, []
 
     def _fetch_violations(self, policy_id: str) -> Tuple[Dict, List[str]]:
-        """GET blocking-settings/violations and group by learn/alarm/block."""
+        """GET blocking-settings/violations using paginated OData calls.
+
+        Uses $top/$skip pagination with a conservative page size to avoid
+        silent truncation — a single $top=500 call may miss violations when
+        the total item count exceeds the limit (BIG-IP ASM can have 200+ entries
+        once HTTP protocol and evasion sub-entries are included).
+
+        $select includes both name (canonical machine ID, e.g. VIRUS_DETECTED) and
+        description (human-readable label, e.g. "Virus detected") so the comparator
+        can join on name while the report shows the description for display.
+        """
+        page_size = 200  # conservative; BIG-IP handles this reliably
+        skip = 0
+        all_items: List[Dict] = []
+        base_path = (
+            f"/mgmt/tm/asm/policies/{policy_id}/blocking-settings/violations"
+        )
+
         try:
-            data = self.client.get(
-                f"/mgmt/tm/asm/policies/{policy_id}/blocking-settings/violations",
-                params={
-                    "$select": "name,description,alarm,block,learn,sectionReference",
-                    "$top":    "500",
-                },
-            )
+            while True:
+                data = self.client.get(
+                    base_path,
+                    params={
+                        "$select": "name,description,alarm,block,learn,sectionReference",
+                        "$top":    str(page_size),
+                        "$skip":   str(skip),
+                    },
+                )
+                items = data.get("items", [])
+                if not items:
+                    break
+                all_items.extend(items)
+                if len(items) < page_size:
+                    break  # last page — fewer items than page size means no more remain
+                skip += page_size
         except Exception as exc:
             return {"learn": [], "alarm": [], "block": []}, [f"violations: {exc}"]
 
@@ -170,12 +196,20 @@ class PolicyInspector:
         alarm: List[Dict] = []
         block: List[Dict] = []
 
-        for item in data.get("items", []):
-            # `name` is the canonical violation identifier (VIOL_*).
-            # Fall back to the description if name is absent (older BIG-IP).
+        for item in all_items:
+            # name = canonical machine ID (e.g. VIRUS_DETECTED); used as join key.
             viol_name = item.get("name", "")
-            desc      = item.get("description", viol_name)
-            entry     = {"description": desc, "name": viol_name or desc}
+            # When name is absent (rare on older BIG-IP), derive it from description.
+            if not viol_name:
+                raw_desc = item.get("description", "")
+                viol_name = raw_desc.upper().replace(" ", "_") if raw_desc else ""
+                if viol_name:
+                    self.log.debug(
+                        "Violation missing 'name' field; derived from description: %s → %s",
+                        raw_desc, viol_name,
+                    )
+            desc  = item.get("description", viol_name)
+            entry = {"description": desc, "name": viol_name or desc}
 
             if item.get("learn"):
                 learn.append(entry)

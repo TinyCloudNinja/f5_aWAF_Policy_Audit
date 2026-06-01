@@ -154,14 +154,22 @@ def _parse_blocking_violation(el) -> Dict:
     """
     Parse a <violation> element from the newer <blocking> section format.
 
-    In this format violations carry both a human-readable 'name' attribute and a
-    machine-readable 'id' attribute (e.g. id="ILLEGAL_SOAP_ATTACHMENT").  The 'id'
-    is the stable key used for comparison; 'name' is kept for display purposes.
+    In this format violations carry both a machine-readable 'id' attribute
+    (e.g. id="VIRUS_DETECTED") and a human-readable 'name' attribute
+    (e.g. name="Virus detected").  We map 'name' to the machine ID so that
+    both XML section formats (<blocking> with id= and <blocking-settings> with
+    <name>MACHINE_ID</name>) and the live REST API all produce violation dicts
+    where 'name' is the canonical join key (all-caps identifier).
     """
+    machine_id   = el.get("id", "")
+    display_name = el.get("name", "") or _text(el, "name")
     pb_raw = _text(el, "policy_builder_tracking") or _text(el, "policy-builder-tracking")
     return {
-        "id":                     el.get("id", ""),
-        "name":                   el.get("name", "") or _text(el, "name"),
+        "id":                     machine_id,
+        # name = canonical machine ID so the comparator can join on name
+        # regardless of which XML section format the baseline was exported with.
+        "name":                   machine_id or display_name,
+        "description":            display_name,  # human-readable label for display
         "alarm":                  _item_as_bool(el, "alarm"),
         "block":                  _item_as_bool(el, "block"),
         "learn":                  _item_as_bool(el, "learn"),
@@ -709,11 +717,25 @@ def get_policy_metadata(xml_path: str) -> Dict:
     }
 
 
+# F5 BIG-IP ships with ~180–220 named violations across all supported versions.
+# A baseline with fewer than this threshold was very likely exported in compact
+# (minimal) mode, which omits default-state violations such as VIRUS_DETECTED.
+_MINIMUM_EXPECTED_VIOLATIONS = 150
+
+
 def parse_policy(xml_path: str) -> Dict:
     """
     Parse an F5 ASM XML policy export into a normalized Python dict.
 
     Returns a nested dictionary with keys matching each policy section.
+
+    Note: the baseline XML must have been exported in full (non-compact) mode
+    so that all violations — including those at their factory defaults such as
+    VIRUS_DETECTED — appear in the XML.  Compact exports (minimal=true) silently
+    omit default-state violations, causing the comparator to miss drift on those
+    entries.  Use the BIG-IP export API with "minimal": false to obtain a full
+    export.  A runtime warning is logged when fewer than _MINIMUM_EXPECTED_VIOLATIONS
+    violations are found, which strongly suggests a compact export.
     """
     _log.debug("Parsing policy XML: %s", xml_path)
     tree = _parse_tree(xml_path)
@@ -726,10 +748,31 @@ def parse_policy(xml_path: str) -> Dict:
                 root = child
                 break
 
+    blocking_settings = _parse_blocking_settings(root)
+    blocking = _parse_blocking(root)
+
+    # Compact-export detection: count violations across both XML section formats.
+    # <blocking-settings> and <blocking> are mutually exclusive in practice —
+    # one will be non-empty and the other empty depending on the BIG-IP version.
+    bs_viol_count = len(blocking_settings.get("violations", []))
+    bl_viol_count = len(blocking.get("violations", []))
+    parsed_violation_count = max(bs_viol_count, bl_viol_count)
+
+    if parsed_violation_count < _MINIMUM_EXPECTED_VIOLATIONS:
+        _log.warning(
+            "Baseline XML contains only %d violations (expected >= %d). "
+            "This policy was likely exported in compact/minimal mode. "
+            "Re-export the baseline with 'minimal=false' to ensure all "
+            "default-state violations (e.g., VIRUS_DETECTED) are included. "
+            "Comparison results will be incomplete.",
+            parsed_violation_count,
+            _MINIMUM_EXPECTED_VIOLATIONS,
+        )
+
     return {
         "general":             _parse_general(root),
-        "blocking-settings":   _parse_blocking_settings(root),
-        "blocking":            _parse_blocking(root),
+        "blocking-settings":   blocking_settings,
+        "blocking":            blocking,
         "attack-signatures":   _parse_attack_signatures(root),
         "signature-sets":      _parse_signature_sets(root),
         "urls":                _parse_urls(root),

@@ -313,3 +313,53 @@ class TestExtraMissing:
             if item.get("section") == "whitelist-ips"
         ]
         assert any("10.0.0.1" in str(item) for item in missing_ips)
+
+
+# ── baseline_compact_warning ───────────────────────────────────────────────────
+
+class TestBaselineCompactWarning:
+    def test_compact_warning_set_when_violations_below_threshold(self):
+        """A baseline with < 150 violations sets baseline_compact_warning=True."""
+        # The fixture baseline has ~59 violations — well below 150.
+        baseline_data = parse_policy(BASELINE)
+        target_data   = parse_policy(DRIFTED)
+        r = compare_policies(baseline=baseline_data, target=target_data,
+                             baseline_name="baseline_policy.xml")
+        assert r.baseline_compact_warning is True
+
+    def test_no_compact_warning_when_violations_at_threshold(self):
+        """A baseline with >= 150 violations does NOT set baseline_compact_warning."""
+        # Manufacture a baseline dict with exactly 150 blocking-settings violations.
+        fake_violations = [{"name": f"VIOL_{i}", "alarm": False, "block": False, "learn": False}
+                           for i in range(150)]
+        baseline_data = {
+            "general":           {"enforcementMode": "blocking"},
+            "blocking-settings": {"violations": fake_violations, "evasions": [], "http-protocols": []},
+            "blocking":          {},
+            "attack-signatures": [],
+            "signature-sets":    [],
+            "urls":              [],
+            "filetypes":         [],
+            "parameters":        [],
+            "headers":           [],
+            "cookies":           [],
+            "methods":           [],
+            "http-protocols":    [],
+            "evasions":          [],
+            "data-guard":        {},
+            "brute-force":       [],
+            "ip-intelligence":   {},
+            "bot-defense":       {},
+            "login-pages":       [],
+            "policy-builder":    {},
+            "whitelist-ips":     [],
+        }
+        target_data = parse_policy(DRIFTED)
+        r = compare_policies(baseline=baseline_data, target=target_data,
+                             baseline_name="full_baseline.xml")
+        assert r.baseline_compact_warning is False
+
+    def test_compact_warning_field_present_on_result(self, result):
+        """ComparisonResult always exposes baseline_compact_warning."""
+        assert hasattr(result, "baseline_compact_warning")
+        assert isinstance(result.baseline_compact_warning, bool)

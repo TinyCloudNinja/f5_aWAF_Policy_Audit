@@ -303,6 +303,57 @@ class TestFetchViolations:
         entry = next(v for v in result["learn"] if v["name"] == "VIOL_ATTACK_SIGNATURE")
         assert entry["description"] == "Attack signature detected"
 
+    def test_pagination_fetches_all_pages(self):
+        """When the first page is full (200 items), a second page must be fetched."""
+        # Build 210 synthetic violations: 200 on page 1, 10 on page 2.
+        base_viol = {"name": "VIOL_X", "description": "X", "learn": True, "alarm": False, "block": False}
+        page1 = [{"name": f"VIOL_{i}", "description": f"v{i}", "learn": True, "alarm": False, "block": False} for i in range(200)]
+        page2 = [{"name": f"VIOL_{i}", "description": f"v{i}", "learn": False, "alarm": True, "block": False} for i in range(200, 210)]
+
+        calls = []
+
+        def _get(path, params=None):
+            params = params or {}
+            if "blocking-settings" in path:
+                calls.append(int(params.get("$skip", 0)))
+                skip = int(params.get("$skip", 0))
+                top  = int(params.get("$top", 200))
+                full = page1 + page2
+                return {"items": full[skip: skip + top]}
+            if "audit-logs" in path:
+                return {"totalItems": 0}
+            return _CORE_RESP
+
+        client = MagicMock()
+        client.get.side_effect = _get
+        inspector = PolicyInspector(client)
+        result, errors = inspector._fetch_violations("abc123")
+        # Both pages fetched
+        assert len(calls) == 2
+        assert calls[0] == 0
+        assert calls[1] == 200
+        # All 210 violations collected (200 in learn from page1, 10 in alarm from page2)
+        learn_names = {v["name"] for v in result["learn"]}
+        assert len(learn_names) == 200
+        alarm_names = {v["name"] for v in result["alarm"]}
+        assert len(alarm_names) == 10
+        assert errors == []
+
+    def test_name_derived_from_description_when_absent(self):
+        """Items with no 'name' field get name derived from upper-cased description."""
+        client = _make_client({
+            "/mgmt/tm/asm/policies/abc123/blocking-settings": {
+                "items": [
+                    {"description": "Virus detected", "learn": True, "alarm": False, "block": False},
+                ]
+            },
+        })
+        inspector = PolicyInspector(client)
+        result, errors = inspector._fetch_violations("abc123")
+        assert errors == []
+        names = {v["name"] for v in result["learn"]}
+        assert "VIRUS_DETECTED" in names
+
 
 # ---------------------------------------------------------------------------
 # PolicyInspector._fetch_signature_sets
