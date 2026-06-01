@@ -22,9 +22,10 @@ _LOG = get_logger("policy_fetcher")
 
 # Sub-resources fetched for every WAF policy.
 # Each entry: (relative path suffix, $select fields)
+# NOTE: blocking-settings/violations is fetched separately via client.get()
+# because F5 ASM does not support OData $top/$skip/$select params on that
+# bounded ~180-item collection — passing them returns a 400 error.
 _WAF_SUB_RESOURCES: List[Tuple[str, Optional[str]]] = [
-    ("blocking-settings/violations",
-     "name,description,alarm,block,learn"),
     ("blocking-settings/evasions",
      "description,enabled"),
     ("blocking-settings/http-protocols",
@@ -304,6 +305,20 @@ class PolicyFetcher:
                     self.log.warning("Sub-resource fetch failed (%s/%s): %s", policy_id, key, exc)
                     sub_data[key] = []
 
+        # ── Fetch violations directly (F5 ASM doesn't support OData params here) ─
+        # The blocking-settings/violations collection is a bounded ~180-item set.
+        # Using get_all() with $top/$skip/$select causes a 400; use a plain GET.
+        try:
+            _viols_resp = self.client.get(f"{base}/blocking-settings/violations")
+            violations_raw: List[Dict] = (
+                _viols_resp.get("items", [])
+                if isinstance(_viols_resp, dict)
+                else []
+            )
+        except Exception as exc:
+            self.log.warning("violations fetch failed (%s): %s", policy_id, exc)
+            violations_raw = []
+
         # ── Fetch non-paginated single-object endpoints ────────────────────────
         single_data: Dict[str, Any] = {}
         with ThreadPoolExecutor(max_workers=self.concurrent) as pool:
@@ -353,9 +368,7 @@ class PolicyFetcher:
             },
             "blocking": {},  # left empty; comparator skips when both sides empty
             "blocking-settings": {
-                "violations":               _normalize_violations(
-                    sub_data.get("blocking-settings/violations", [])
-                ),
+                "violations":               _normalize_violations(violations_raw),
                 "evasions":                 _normalize_bool_items(
                     sub_data.get("blocking-settings/evasions", [])
                 ),

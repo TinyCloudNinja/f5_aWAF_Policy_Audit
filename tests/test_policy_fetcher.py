@@ -277,20 +277,20 @@ class TestFetchWafPolicy:
             assert key in result, f"Missing key: {key}"
 
     def test_violations_normalized(self):
+        """Violations are fetched via client.get() (not get_all) to avoid OData errors."""
         client = MagicMock()
-        client.get.return_value = {"enforcementMode": "blocking", "policyBuilder": {}}
-
         violations = [
             {"name": "VIRUS_DETECTED", "alarm": True, "block": True, "learn": False,
              "description": "Virus detected"},
         ]
 
-        def fake_get_all(path, params=None):
+        def fake_get(path, params=None):
             if "blocking-settings/violations" in path:
-                return violations
-            return []
+                return {"items": violations}
+            return {"enforcementMode": "blocking", "policyBuilder": {}}
 
-        client.get_all.side_effect = fake_get_all
+        client.get.side_effect = fake_get
+        client.get_all.return_value = []
         fetcher = PolicyFetcher(client)
         result = fetcher.fetch_waf_policy(_make_policy())
         viols = result["blocking-settings"]["violations"]
