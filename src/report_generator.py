@@ -891,39 +891,90 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
     if getattr(result, "profile_type", "waf") != "waf":
         return ""
 
-    target_map = _normalize_violations_map(result.violations or [])
-    baseline_map = _normalize_violations_map(result.baseline_violations or [])
+    target_viols: List[Dict] = result.violations or []
+    baseline_viols: List[Dict] = result.baseline_violations or []
 
-    if not target_map and not baseline_map:
+    if not target_viols and not baseline_viols:
         return "<p class='muted'>No WAF violation settings were available for comparison.</p>"
+
+    # Robust cross-format join: F5 exports the same violations in two formats —
+    # <blocking> uses id="EVASION_DETECTED" name="Human name", while
+    # <blocking-settings> uses only name="EVASION_DETECTED" (machine ID as name).
+    # Index each side by both id and name so we match regardless of which format
+    # each side came from.
+    def _vid(v: Dict) -> str:
+        return str(v.get("id") or "").strip()
+
+    def _vname(v: Dict) -> str:
+        return str(v.get("name") or "").strip()
+
+    def _canonical(v: Dict) -> str:
+        return _vid(v) or _vname(v)
+
+    def _build_dual(viols: List[Dict]):
+        by_id: Dict[str, Dict] = {}
+        by_name: Dict[str, Dict] = {}
+        for v in viols:
+            if _vid(v):
+                by_id[_vid(v)] = v
+            if _vname(v):
+                by_name[_vname(v)] = v
+        return by_id, by_name
+
+    def _find_in(v: Dict, by_id: Dict, by_name: Dict) -> Optional[Dict]:
+        vid, vname = _vid(v), _vname(v)
+        if vid:
+            if vid in by_id:
+                return by_id[vid]
+            if vid in by_name:    # target id matches baseline name (blocking-settings format)
+                return by_name[vid]
+        if vname:
+            if vname in by_id:    # target name matches baseline id
+                return by_id[vname]
+            if vname in by_name:
+                return by_name[vname]
+        return None
+
+    t_by_id, t_by_name = _build_dual(target_viols)
+    b_by_id, b_by_name = _build_dual(baseline_viols)
 
     def _is_active(v: Dict) -> bool:
         return bool(v.get("block") or v.get("alarm") or v.get("enabled"))
 
+    seen_target: set = set()
     bucket_a: List[Any] = []   # active on policy, not in baseline
     bucket_b: List[Any] = []   # in both, all attrs match
     bucket_c: List[Any] = []   # in both, at least one attr differs
     bucket_e: List[Any] = []   # on policy, not active, not in baseline
 
-    for vid, v in target_map.items():
-        if vid in baseline_map:
-            b = baseline_map[vid]
+    for v in target_viols:
+        key = _canonical(v)
+        if not key or key in seen_target:
+            continue
+        seen_target.add(key)
+        b = _find_in(v, b_by_id, b_by_name)
+        if b is not None:
             if (v.get("alarm") == b.get("alarm")
                     and v.get("block") == b.get("block")
                     and v.get("learn") == b.get("learn")):
-                bucket_b.append((vid, v, b))
+                bucket_b.append((v, b))
             else:
-                bucket_c.append((vid, v, b))
+                bucket_c.append((v, b))
         else:
             if _is_active(v):
-                bucket_a.append((vid, v))
+                bucket_a.append(v)
             else:
-                bucket_e.append((vid, v))
+                bucket_e.append(v)
 
+    seen_baseline: set = set()
     bucket_d: List[Any] = []   # in baseline, absent from policy
-    for vid, b in baseline_map.items():
-        if vid not in target_map:
-            bucket_d.append((vid, b))
+    for b in baseline_viols:
+        key = _canonical(b)
+        if not key or key in seen_baseline:
+            continue
+        seen_baseline.add(key)
+        if _find_in(b, t_by_id, t_by_name) is None:
+            bucket_d.append(b)
 
     EM = "&#8212;"
 
@@ -951,10 +1002,10 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
         "Violations Active on Policy — Not in Baseline", len(bucket_a), "#e67e22"
     ))
     if bucket_a:
-        for vid, v in bucket_a:
+        for v in bucket_a:
             tbody.append(
                 "<tr>"
-                f"<td>{_esc(_format_violation_name(v, vid))}</td>"
+                f"<td>{_esc(_format_violation_name(v, _canonical(v)))}</td>"
                 f"<td>{_esc(_fmt_setting(v.get('learn')))}</td>"
                 f"<td>{_esc(_fmt_setting(v.get('alarm')))}</td>"
                 f"<td>{_esc(_fmt_setting(v.get('block')))}</td>"
@@ -968,10 +1019,10 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
     # Bucket B — matching baseline
     tbody.append(_bucket_hdr("Violations Matching Baseline", len(bucket_b), "#27ae60"))
     if bucket_b:
-        for vid, v, b in bucket_b:
+        for v, b in bucket_b:
             tbody.append(
                 "<tr>"
-                f"<td>{_esc(_format_violation_name(v, vid))}</td>"
+                f"<td>{_esc(_format_violation_name(v, _canonical(v)))}</td>"
                 f"<td>{_esc(_fmt_setting(v.get('learn')))}</td>"
                 f"<td>{_esc(_fmt_setting(v.get('alarm')))}</td>"
                 f"<td>{_esc(_fmt_setting(v.get('block')))}</td>"
@@ -987,13 +1038,13 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
     # Bucket C — drift (differs from baseline)
     tbody.append(_bucket_hdr("Violations Differing from Baseline", len(bucket_c), "#c0392b"))
     if bucket_c:
-        for vid, v, b in bucket_c:
+        for v, b in bucket_c:
             learn_diff = v.get("learn") != b.get("learn")
             alarm_diff = v.get("alarm") != b.get("alarm")
             block_diff = v.get("block") != b.get("block")
             tbody.append(
                 "<tr>"
-                f"<td>{_esc(_format_violation_name(v, vid))}</td>"
+                f"<td>{_esc(_format_violation_name(v, _canonical(v)))}</td>"
                 + _cell(v.get("learn"), learn_diff)
                 + _cell(v.get("alarm"), alarm_diff)
                 + _cell(v.get("block"), block_diff)
@@ -1011,10 +1062,10 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
         "Baseline Violations Not Present in Policy", len(bucket_d), "#c0392b"
     ))
     if bucket_d:
-        for vid, b in bucket_d:
+        for b in bucket_d:
             tbody.append(
                 "<tr>"
-                f"<td>{_esc(_format_violation_name(b, vid))}</td>"
+                f"<td>{_esc(_format_violation_name(b, _canonical(b)))}</td>"
                 f"<td>{EM}</td><td>{EM}</td><td>{EM}</td>"
                 f"<td>{_esc(_fmt_setting(b.get('learn')))}</td>"
                 f"<td>{_esc(_fmt_setting(b.get('alarm')))}</td>"
@@ -1038,9 +1089,9 @@ def _build_waf_violations_vs_baseline_html(result: ComparisonResult) -> str:
     # Bucket E — out of scope (collapsed by default)
     if bucket_e:
         e_rows = [
-            f"<tr><td>{_esc(_format_violation_name(v, vid))}</td>"
+            f"<tr><td>{_esc(_format_violation_name(v, _canonical(v)))}</td>"
             "<td class='muted'>Not active on policy; not in baseline</td></tr>"
-            for vid, v in bucket_e
+            for v in bucket_e
         ]
         e_inner = (
             "<table class='results'>"
