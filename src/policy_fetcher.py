@@ -9,6 +9,7 @@ Read-only guarantee: this module issues GET requests only.
 """
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -130,14 +131,32 @@ def _normalize_bool_items(items: List[Dict]) -> List[Dict]:
     return result
 
 
-def _normalize_signature_sets(items: List[Dict]) -> List[Dict]:
+def _normalize_signature_sets(
+    items: List[Dict],
+    name_lookup: Optional[Dict[str, str]] = None,
+) -> List[Dict]:
+    """Normalize policy signature-set items.
+
+    The policy sub-collection does not embed the human-readable set name; it
+    only carries a ``signatureSetReference.link`` pointing to the global
+    catalog entry.  When ``name_lookup`` (id→name from the global endpoint) is
+    provided, we resolve the real name from there.  Without it we fall back to
+    the bare hash ID from the link (better than nothing, but not readable).
+    """
     result = []
     for item in items:
         name = str(item.get("name") or "").strip()
         if not name:
             ref = item.get("signatureSetReference") or {}
             link = ref.get("link", "") if isinstance(ref, dict) else ""
-            name = link.rstrip("/").split("/")[-1] if link else ""
+            if link:
+                # Strip trailing slash, take last path segment, drop ?ver=... param
+                raw = link.rstrip("/").split("/")[-1]
+                sig_id = raw.split("?")[0]
+                if name_lookup:
+                    name = name_lookup.get(sig_id, "")
+                if not name:
+                    name = sig_id  # fallback to ID when lookup unavailable
         if not name:
             continue
         result.append({
@@ -229,6 +248,41 @@ class PolicyFetcher:
         self.client = client
         self.concurrent = concurrent
         self.log = get_logger("policy_fetcher")
+        # Lazily populated by _get_sig_set_names(); shared across all policy
+        # fetches so the global catalog is only downloaded once per run.
+        self._sig_set_name_cache: Optional[Dict[str, str]] = None
+        self._sig_set_cache_lock = threading.Lock()
+
+    def _get_sig_set_names(self) -> Dict[str, str]:
+        """Return a {sig_set_id: human_name} dict, fetched once and cached.
+
+        Thread-safe via double-checked locking — multiple concurrent
+        fetch_waf_policy() calls share a single cached lookup.
+        """
+        if self._sig_set_name_cache is not None:
+            return self._sig_set_name_cache
+        with self._sig_set_cache_lock:
+            if self._sig_set_name_cache is None:
+                try:
+                    items = self.client.get_all(
+                        "/mgmt/tm/asm/signature-sets",
+                        params={"$select": "id,name"},
+                    )
+                    self._sig_set_name_cache = {
+                        item["id"]: item["name"]
+                        for item in items
+                        if item.get("id") and item.get("name")
+                    }
+                    self.log.debug(
+                        "Cached %d global signature-set name(s)",
+                        len(self._sig_set_name_cache),
+                    )
+                except Exception as exc:
+                    self.log.warning(
+                        "Could not fetch global signature-set names: %s", exc
+                    )
+                    self._sig_set_name_cache = {}
+        return self._sig_set_name_cache
 
     # ── Discovery ──────────────────────────────────────────────────────────────
 
@@ -364,6 +418,12 @@ class PolicyFetcher:
         except Exception:
             learning_mode = "disabled"
 
+        # ── Resolve signature-set names from global catalog ───────────────────
+        # The policy's /signature-sets sub-collection carries only a hash ID
+        # in signatureSetReference.link; the human-readable name lives in the
+        # global /mgmt/tm/asm/signature-sets endpoint.
+        sig_set_names = self._get_sig_set_names()
+
         # ── Normalize and return ───────────────────────────────────────────────
         return {
             # Top-level metadata
@@ -397,7 +457,8 @@ class PolicyFetcher:
                 ),
             },
             "signature-sets":   _normalize_signature_sets(
-                sub_data.get("signature-sets", [])
+                sub_data.get("signature-sets", []),
+                name_lookup=sig_set_names,
             ),
             "attack-signatures": _normalize_attack_signatures(
                 sub_data.get("signatures", [])
