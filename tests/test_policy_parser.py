@@ -292,3 +292,49 @@ class TestParseBlockingSection:
     def test_drifted_virus_detected_block_false(self):
         viol = next(v for v in self.bl_drift["violations"] if v["id"] == "VIRUS_DETECTED")
         assert viol["block"] is False
+
+
+# ── Violation ID alias normalization ─────────────────────────────────────────
+
+class TestViolationIdAliases:
+    """Old BIG-IP XML exports use deprecated violation IDs (e.g. MALFORMED_JSON)
+    while the current REST API uses renamed IDs (MALFORMED_JSON_DATA).  The parser
+    must normalize these so baseline XML and live REST target join correctly."""
+
+    def _parse_xml_with_violation(self, old_id: str, display_name: str) -> list:
+        """Build a minimal in-memory XML with a single <blocking><violation> and parse it."""
+        import xml.etree.ElementTree as ET
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from src.policy_parser import _parse_blocking_violation
+        el = ET.fromstring(
+            f'<violation name="{display_name}" id="{old_id}">'
+            '<alarm>false</alarm><block>false</block><learn>false</learn>'
+            '<policy_builder_tracking>enabled</policy_builder_tracking>'
+            '</violation>'
+        )
+        return _parse_blocking_violation(el)
+
+    def test_malformed_json_normalized_to_data_variant(self):
+        v = self._parse_xml_with_violation("MALFORMED_JSON", "Malformed JSON data")
+        assert v["id"] == "MALFORMED_JSON_DATA"
+        assert v["name"] == "MALFORMED_JSON_DATA"
+
+    def test_malformed_gwt_normalized(self):
+        v = self._parse_xml_with_violation("MALFORMED_GWT", "Malformed GWT data")
+        assert v["id"] == "MALFORMED_GWT_DATA"
+        assert v["name"] == "MALFORMED_GWT_DATA"
+
+    def test_malformed_xml_normalized(self):
+        v = self._parse_xml_with_violation("MALFORMED_XML", "Malformed XML data")
+        assert v["id"] == "MALFORMED_XML_DATA"
+        assert v["name"] == "MALFORMED_XML_DATA"
+
+    def test_unaliased_id_unchanged(self):
+        v = self._parse_xml_with_violation("VIRUS_DETECTED", "Virus detected")
+        assert v["id"] == "VIRUS_DETECTED"
+        assert v["name"] == "VIRUS_DETECTED"
+
+    def test_display_name_still_preserved(self):
+        v = self._parse_xml_with_violation("MALFORMED_JSON", "Malformed JSON data")
+        assert v["description"] == "Malformed JSON data"
