@@ -373,3 +373,385 @@ review-pending TUI flow (Accept, Reject, Diff); the CLI non-interactive equivale
 - [ ] `lxml` optional: new canonicalization helpers work with the stdlib fallback.
 - [ ] Existing CLI flags unchanged and tested end-to-end with the existing fixture set.
 - [ ] `--gitlab-*` flags emit a `DeprecationWarning` but remain functional.
+
+---
+
+# New Refactor: API-Driven Data Collection + Interactive TUI
+
+> **Scope:** Eliminate the on-disk XML baseline dependency; replace partial
+> `PolicyInspector` data collection with full API-driven `PolicyFetcher`;
+> introduce a `questionary`-based interactive TUI. Phases below are sequential;
+> stop after Phase 0 for review.
+
+---
+
+## Module Changes Summary
+
+| Module | Change | Reason |
+|---|---|---|
+| `src/main.py` | **Modified** | New CLI contract, interactive dispatch, updated run loop, error handling |
+| `src/bigip_client.py` | **Modified** | Add `get_all()` pagination helper |
+| `src/policy_exporter.py` | **Retained** | Policy discovery + VS enrichment unchanged |
+| `src/policy_parser.py` | **Deprecated** → `src/_deprecated/policy_parser.py` | Replaced by API fetcher; kept for `gitlab_state.py` compat during transition |
+| `src/policy_inspector.py` | **Retained (for `--INSPECT` mode)** | Superseded for WAF/BOT audit by `policy_fetcher.py`; keep for targeted inspection |
+| `src/policy_comparator.py` | **Modified** | Field-access alignment with new API dict schema; no logic changes |
+| `src/bot_defense_auditor.py` | **Retained / Wrapped** | `list_bot_profiles()` extracted to `policy_fetcher.py`; full fetch logic reused |
+| `src/bot_defense_comparator.py` | **Retained** | No changes; comparison logic is data-format-agnostic |
+| `src/report_generator.py` | **Retained** | No changes; `_XML_VIOL_ID_ALIASES` import moved to `utils.py` in Phase 4 |
+| `src/gitlab_state.py` | **Modified** | `load_waf_source_of_truth()` uses JSON fallback; XML parse kept as legacy fallback |
+| `src/utils.py` | **Retained** | Minor: HTTPS URL masking regex (if not already fixed) |
+| `src/virtual_server_inventory.py` | **Retained** | No changes |
+| `src/interactive.py` | **New** | `questionary`-based interactive menus; importable without a TTY |
+| `src/policy_fetcher.py` | **New** | Full API-driven WAF + Bot data collection pipeline |
+
+---
+
+## Phase 0 — Audit & Plan (Complete — No Code Changes)
+
+**Deliverables:** Updated `REVIEW.md` (Sections A–E) and this `PLAN.md` section.
+
+**Test status:** 164/164 pass. Zero failures recorded.
+
+**Key findings:**
+- No XML export task (`/mgmt/tm/asm/tasks/export-policy`) exists in current code — it was removed in a prior refactor. `bigip_client.download_file()` and `upload_file()` exist but are uncalled.
+- The remaining XML dependency is solely the on-disk `--baseline` file parsed by `policy_parser.parse_policy()`.
+- `policy_parser.py` is also used by `gitlab_state.load_waf_source_of_truth()` for XML SoT files.
+- `report_generator.py` imports `_XML_VIOL_ID_ALIASES` from `policy_parser`; this must be moved to `utils.py` in Phase 4.
+- `questionary>=2.0` is the selected interactive library (see REVIEW.md Section D).
+- SSL inversion bug (`main.py:405–409`) and token refresh credential-clearing bug (`bigip_client.py:110`) remain unresolved from prior REVIEW.md.
+
+---
+
+## Phase 1 — Interactive Entry Point
+
+### 1.1 CLI Contract Change
+
+**Files:** `src/main.py`
+
+**New minimum invocation:**
+```bash
+python -m src.main --host 10.1.1.4 --username admin
+```
+
+**Full non-interactive (CI) invocation:**
+```bash
+python -m src.main \
+  --host 10.1.1.4 --username admin \
+  --password 'S3cret!' \
+  --mode WAF \
+  --baseline-policy "~Common~BST_Corporate_Baseline_v2" \
+  --output-dir ./audit_results \
+  --no-verify-ssl
+```
+
+**Flags removed:**
+- `--baseline` (filesystem path) — replaced by `--baseline-policy` (API name)
+- `--partitions` — auto-discovered
+- `--concurrent-exports` — no longer relevant
+- `--WAF` / `--BOT` / `--INSPECT` — replaced by `--mode {WAF,BOT,INSPECT}`
+- `--export-format` — removed entirely
+
+**Flags preserved:**
+- `--output-dir`, `--no-verify-ssl` / `--verify-ssl`, `--verbose` / `-v`, `--format`
+
+**Flags added:**
+- `--mode {WAF,BOT,INSPECT}` — non-interactive mode selection
+- `--baseline-policy` — non-interactive baseline policy fullPath/name
+- `--password` — non-interactive password (still optional; interactive fallback)
+
+**Non-interactive bypass rule:** If `--mode`, `--baseline-policy`, and
+`--password` are ALL provided, skip all `questionary` prompts.
+
+**Fix bundled into Phase 1:**
+- SSL inversion bug (`main.py:405–409`): `in ("0", "false", "no")` → `in ("1", "true", "yes")`
+
+### 1.2 New module: `src/interactive.py`
+
+**Dependencies added:** `questionary>=2.0` → `requirements.txt`
+
+**Public API:**
+
+```python
+BASELINE_PREFIX = "BST"   # top-level constant — configurable, never hardcoded
+
+def run_interactive(
+    host: str,
+    username: str,
+    output_dir: str,
+    verify_ssl: bool,
+    report_format: str,
+    verbose: bool,
+) -> int:
+    """Top-level interactive flow. Returns exit code."""
+
+def prompt_password(username: str, host: str) -> str: ...
+def prompt_mode() -> str:              # "WAF" | "BOT"
+def prompt_baseline(
+    client: BigIPClient, mode: str
+) -> dict:                             # selected policy/profile metadata dict
+def prompt_policies(
+    client: BigIPClient, mode: str, baseline_full_path: str
+) -> list[dict]:                       # selected policy/profile metadata dicts
+def prompt_confirm(
+    mode: str, baseline: dict, policies: list[dict], output_dir: str
+) -> bool: ...
+```
+
+**Interactive flow:**
+
+1. Password prompt (`questionary.password()`) if `--password` not supplied.
+2. Connect & authenticate; print `✓ Connected to BIG-IP {host} ({version})`.
+3. Mode menu (`questionary.select()`): WAF / Bot Defense.
+4. Baseline candidates: `GET /mgmt/tm/asm/policies?$select=name,fullPath,id&$top=500`
+   filtered to `name.upper().startswith(BASELINE_PREFIX)`, sorted alphabetically.
+   Display as arrow-key list. Exit 1 if no BST policies found.
+5. Comparison policy candidates: same endpoint, exclude baseline, display as
+   `questionary.checkbox()` multi-select. Space=toggle, `a`=all.
+6. Confirm screen: print Mode/Baseline/Policies/Output. `questionary.confirm("Proceed?")`.
+   If No, loop back to step 3.
+
+**Non-TTY guard:** `if not sys.stdin.isatty(): raise RuntimeError("not a TTY")`
+at module entry; call sites catch and fall through to non-interactive path.
+
+**Tests:** `tests/test_interactive.py`
+- Mock `questionary.select`, `questionary.checkbox`, `questionary.password`.
+- Assert BST filter excludes non-BST policies (case-insensitive).
+- Assert non-interactive mode (all flags provided) calls none of the prompts.
+- Assert `BASELINE_PREFIX` constant is "BST" and is used by the filter function.
+- Assert non-TTY raises gracefully.
+
+---
+
+## Phase 2 — API-Driven Data Collection
+
+### 2.1 New module: `src/policy_fetcher.py`
+
+**Public API:**
+
+```python
+class PolicyFetcher:
+    def __init__(self, client: BigIPClient): ...
+
+    def list_waf_policies(self) -> list[dict]:
+        """[{name, fullPath, id, enforcementMode, active}]"""
+
+    def list_bot_profiles(self) -> list[dict]:
+        """[{name, fullPath}]"""
+
+    def fetch_waf_policy(self, policy_id: str) -> dict:
+        """Fetch all comparable WAF policy data. Returns normalized dict."""
+
+    def fetch_bot_profile(self, profile_full_path: str) -> dict:
+        """Fetch all comparable Bot Defense profile data. Returns normalized dict."""
+```
+
+**WAF policy fetch — all sub-resources (paginated):**
+
+| Sub-resource path | Key fields |
+|---|---|
+| `/general` | `enforcementMode`, `applicationLanguage`, `trustXff`, `responseLogging`, `signatureStaging`, `maskCreditCardNumbers`, `placeSignaturesInStaging` |
+| `/blocking-settings/violations` | `name`, `description`, `alarm`, `block`, `learn` |
+| `/blocking-settings/evasions` | `description`, `enabled` |
+| `/blocking-settings/http-protocols` | `description`, `enabled` |
+| `/blocking-settings/web-services-securities` | `description`, `enabled` |
+| `/signature-sets` | `name`, `alarm`, `block`, `learn`, `signatureSet.name` |
+| `/signatures` | `signatureReference.name`, `enabled`, `performStaging`, `alarmState` |
+| `/urls` | `name`, `method`, `type`, `attackSignaturesCheck`, `performStaging`, `isAllowed` |
+| `/filetypes` | `name`, `type`, `queryStringLength`, `requestLength`, `responseCheck`, `attackSignaturesCheck` |
+| `/parameters` | `name`, `type`, `sensitiveParameter`, `attackSignaturesCheck`, `performStaging`, `valueType` |
+| `/headers` | `name`, `checkSignatures`, `mandatory`, `allowRepeatedOccurrences` |
+| `/cookies` | `name`, `enforcementType`, `attackSignaturesCheck`, `performStaging` |
+| `/methods` | `name`, `actAsMethod` |
+| `/data-guard` | `enabled`, `creditCardNumbers`, `usSocialSecurityNumbers`, `customPatterns`, `exceptionPatterns` |
+| `/ip-intelligence` | `enabled`, `defaultAction`, categories |
+| `/whitelist-ips` | `blockRequests`, `trustedByPolicyBuilder`, `ignoreAnomalies`, `ipAddress`, `ipMask` |
+| `/login-pages` | `url`, `authenticationType`, `usernameParameterName` |
+| `/brute-force-attack-preventions` | `url`, `maximumLoginAttempts`, `preventionDuration` |
+| `/json-profiles` | `name`, defenseAttributes |
+| `/xml-profiles` | `name`, defenseAttributes |
+| `/plain-text-profiles` | `name`, defenseAttributes |
+| `/session-tracking` | `sessionTrackingConfiguration` |
+
+**Normalized WAF dict schema** (must be compatible with `policy_comparator.compare_policies()`):
+
+```python
+{
+    # Top-level metadata
+    "name": str, "fullPath": str, "id": str,
+    "enforcementMode": str,        # "blocking" | "transparent"
+    "applicationLanguage": str,
+    "active": bool,
+    "signatureStaging": bool,
+    "trustXff": bool,
+    "responseLogging": str,
+    "maskCreditCardNumbers": bool,
+    # Comparator-facing sections (keyed to match policy_parser output)
+    "general": {"enforcementMode": str, "signatureStaging": bool, ...},
+    "blocking-settings": {
+        "violations": [{"name": str, "description": str, "alarm": bool, "block": bool, "learn": bool}],
+        "evasions":   [{"description": str, "enabled": bool}],
+        "http-protocols": [{"description": str, "enabled": bool}],
+    },
+    "blocking": {},               # left empty; comparator skips if empty
+    "signature-sets": [{"name": str, "alarm": bool, "block": bool, "learn": bool}],
+    "attack-signatures": [],      # policy-level overrides only
+    "urls": [...], "filetypes": [...], "parameters": [...],
+    "headers": [...], "cookies": [...], "methods": [...],
+    "data-guard": {...}, "ip-intelligence": {...},
+    "whitelist-ips": [...], "login-pages": [...],
+    "brute-force": [...], "policy-builder": {},
+    "bot-defense": {},
+}
+```
+
+**Field alignment note:** `policy_comparator._cmp_blocking()` checks
+`baseline.get("blocking", {})`. Since the new dict leaves `"blocking"` empty,
+that comparator branch silently skips — correct behavior. All violations come
+through `"blocking-settings".violations` which `_cmp_blocking_settings()`
+already handles. No logic changes needed in the comparator; only verify that
+`"blocking-settings"` key is present with the correct structure.
+
+### 2.2 `get_all()` pagination helper — `src/bigip_client.py`
+
+Add as a public method:
+
+```python
+def get_all(self, path: str, params: dict | None = None) -> list:
+    """Fetch all pages from a paged iControl REST collection.
+    Uses $top=500 and $skip pagination. Raises on HTTP errors."""
+    params = dict(params or {})
+    params.setdefault("$top", 500)
+    items: list = []
+    skip = 0
+    while True:
+        params["$skip"] = skip
+        data = self.get(path, params=params)
+        page = data.get("items", [])
+        items.extend(page)
+        total = data.get("totalItems", len(items))
+        if len(items) >= total:
+            break
+        skip += len(page)
+        if not page:
+            break          # safety: prevent infinite loop on empty page
+    return items
+```
+
+### 2.3 Deprecate `src/policy_parser.py`
+
+Move to `src/_deprecated/policy_parser.py`. Add at the top of the file:
+
+```python
+import warnings
+warnings.warn(
+    "policy_parser is deprecated. Use PolicyFetcher.fetch_waf_policy() instead.",
+    DeprecationWarning, stacklevel=2,
+)
+```
+
+Update `src/gitlab_state.py` to import from `src._deprecated.policy_parser`
+and add a comment marking the import as transitional.
+
+`report_generator.py` imports `_XML_VIOL_ID_ALIASES` — this dict is small and
+pure data; copy it into `utils.py` and update the import in Phase 4.
+
+### 2.4 `gitlab_state.load_waf_source_of_truth()` update
+
+After Phase 2, new SoT files are JSON (the normalized API dict). Existing SoT
+files may be XML. Update `load_waf_source_of_truth()` to:
+
+1. Try reading `<path>.json` first.
+2. Fall back to `<path>.xml` + `parse_policy()` if JSON not found.
+3. Log a migration hint when XML fallback is used.
+
+**Tests:**
+- `tests/test_policy_fetcher.py`: mock `BigIPClient.get()`; test pagination
+  (mock `totalItems=700` → 2 calls); test empty items; test WAF and Bot
+  normalization round-trip.
+- All 164 existing tests must continue to pass after schema alignment.
+
+---
+
+## Phase 3 — Progress Display & Orchestration
+
+### 3.1 Updated run loop in `main.py`
+
+```
+1. Fetch baseline policy data via PolicyFetcher.
+   Print: "✓ Baseline fetched: <fullPath> (N violations, M sig sets)"
+
+2. For each selected comparison policy (with [N/M] counter):
+   a. PolicyFetcher.fetch_waf_policy() or fetch_bot_profile()
+   b. compare_policies() / compare_bot_profiles()
+   c. generate_markdown() if format includes markdown
+   Print per-policy: "  [1/3] <fullPath>  87.4%  ⚠  14 diffs"
+
+3. generate_html_dashboard() once for all results.
+   Print: "✓ Dashboard → <output_dir>/WAF_audit_dashboard.html"
+
+4. generate_summary_reports()
+5. Print final summary table to stdout.
+6. Exit 0 if all scores ≥ threshold, else exit 1.
+```
+
+### 3.2 Error handling
+
+| Condition | Behavior |
+|---|---|
+| Baseline fetch fails (404, timeout) | Abort, exit 1, clear message |
+| Policy fetch fails | Log error, mark `status: "fetch_failed"`, continue |
+| All policies fail | Exit 2 |
+| `KeyboardInterrupt` | Print `\nAborted.`, exit 130 |
+
+**Tests:** `tests/test_main_phase3.py`
+- Mock one policy fetch to raise — assert others still run.
+- Baseline fetch raises → exit 1.
+- KeyboardInterrupt at top-level loop → exit 130.
+
+---
+
+## Phase 4 — Cleanup & Testing
+
+### 4.1 Remove dead code
+
+| Item | Action |
+|---|---|
+| `src/_deprecated/policy_parser.py` | Delete after `gitlab_state.py` JSON migration complete |
+| `bigip_client.upload_file()` | Delete (unused) |
+| `bigip_client.download_file()` | Delete (unused) |
+| `bigip_client._parse_content_range_total()` | Delete (dead code, noted in REVIEW.md) |
+| `--concurrent-exports` CLI flag | Remove |
+| `import xml.etree.ElementTree as ET` in `main.py` | Remove once `_validate_xml()` deleted |
+| `_validate_xml()` in `main.py` | Remove |
+| `_load_json_baseline()` in `main.py` | Remove (BOT baseline is now API-driven) |
+
+### 4.2 Update tests
+
+- Update all test fixtures that used XML-parsed dicts to use API-normalized dicts
+  (structure is identical after Phase 2 schema alignment; only source changes).
+- Add Bot Defense comparison unit tests:
+  - `enforcement` diff: baseline=`blocking`, target=`transparent` → CRITICAL.
+  - Bot class action diff: baseline blocks, target allows → CRITICAL.
+  - Whitelist entry in target not in baseline → WARNING.
+- Run full suite; confirm 164+ green.
+
+### 4.3 Update documentation
+
+- `README.md`: new invocation pattern, interactive session transcript.
+- `APP_REVIEW_FOR_AI.md`: updated module list with `policy_fetcher.py` and `interactive.py`.
+- `CHANGELOG.md`: entry for this refactor.
+
+---
+
+## Non-Negotiable Constraints (Checklist)
+
+- [ ] **Read-only:** After refactor, all BIG-IP HTTP is GET only.
+- [ ] **No credentials on disk:** Password only from `--password`, `BIGIP_PASS` env, or interactive prompt.
+- [ ] **SSL default = False** with visible warning; `--verify-ssl` enables. Fix inversion bug in Phase 1.
+- [ ] **Token auth preserved;** fix credential-clearing bug (keep `self._password` until `close()`).
+- [ ] **`get_all()` pages until `totalItems` exhausted.** Never assume single page.
+- [ ] **`BASELINE_PREFIX = "BST"`** constant in `interactive.py`; case-insensitive; configurable.
+- [ ] **BOT_DEFENSE_LICENSED guard:** catch 404, print clear message, exit 1 cleanly.
+- [ ] **Python 3.10+.** No `match/case` unless already in codebase (currently not used).
+- [ ] **Approved new deps:** `questionary>=2.0`, `tqdm` (optional progress bar). No others.
+- [ ] **Stop after Phase 0** — do not proceed to Phase 1 without review confirmation.
