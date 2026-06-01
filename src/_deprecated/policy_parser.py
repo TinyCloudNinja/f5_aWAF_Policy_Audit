@@ -26,7 +26,7 @@ except ImportError:
     import xml.etree.ElementTree as ET  # type: ignore
     _LXML = False
 
-from ..utils import get_logger
+from ..utils import get_logger, _XML_VIOL_ID_ALIASES
 
 _log = get_logger("policy_parser")
 
@@ -159,24 +159,6 @@ def _parse_blocking_settings(root) -> Dict:
         "evasions":        [_parse_blocking_item(e) for e in _findall(bs, "evasion")],
         "http-protocols":  [_parse_blocking_item(h) for h in _findall(bs, "http-protocol")],
     }
-
-
-# ── Violation ID alias table ───────────────────────────────────────────────────
-#
-# F5 BIG-IP renamed several violation machine IDs between software versions.
-# The XML export format preserves the *old* id= attribute while the iControl
-# REST API (/blocking-settings/violations) returns the *new* name.  Normalizing
-# at parse time ensures that both the XML baseline and the REST-based target use
-# the same canonical ID so the comparator can join them.
-#
-# Mapping is intentionally explicit (not a blanket suffix rule) to avoid masking
-# genuine ID differences introduced by future F5 version changes.
-
-_XML_VIOL_ID_ALIASES: Dict[str, str] = {
-    "MALFORMED_JSON": "MALFORMED_JSON_DATA",
-    "MALFORMED_GWT":  "MALFORMED_GWT_DATA",
-    "MALFORMED_XML":  "MALFORMED_XML_DATA",
-}
 
 
 def _parse_blocking_violation(el) -> Dict:

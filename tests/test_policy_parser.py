@@ -1,5 +1,5 @@
 """
-Unit tests for src/policy_parser.py
+Unit tests for the XML ASM policy parser (src._deprecated.policy_parser).
 """
 import sys
 import os
@@ -10,7 +10,7 @@ import pytest
 # Allow running from repo root without installing the package
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.policy_parser import parse_policy, get_policy_metadata
+from src._deprecated.policy_parser import parse_policy, get_policy_metadata
 
 FIXTURES = Path(__file__).parent / "fixtures"
 BASELINE = str(FIXTURES / "baseline_policy.xml")
@@ -306,7 +306,7 @@ class TestViolationIdAliases:
         import xml.etree.ElementTree as ET
         import sys
         sys.path.insert(0, str(Path(__file__).parent.parent))
-        from src.policy_parser import _parse_blocking_violation
+        from src._deprecated.policy_parser import _parse_blocking_violation
         el = ET.fromstring(
             f'<violation name="{display_name}" id="{old_id}">'
             '<alarm>false</alarm><block>false</block><learn>false</learn>'
