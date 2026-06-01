@@ -3,20 +3,27 @@ bigip:
   username: "admin"
   # password: NOT supported here — use the BIGIP_PASS environment variable
   #            or the interactive prompt to avoid plaintext credentials on disk.
-  verify_ssl: true           # Set to false only for self-signed certs (dev/lab)
+  verify_ssl: false          # false = accept self-signed certs (default); true = enforce TLS
   login_provider: "tmos"     # Change for RADIUS/LDAP/AD auth providers
 
 audit:
-  baseline_policy: "./baseline/corporate_baseline.xml"
+  # baseline_policy: "~Common~BST_Corporate_Baseline"
+  #   The fullPath of the BST-prefixed baseline policy/profile on the device.
+  #   Example values:  "~Common~BST_Corporate_Baseline"  |  "/Common/BST_PCI_Strict"
+  #   Leave commented-out to use the interactive selector on a TTY,
+  #   or supply via --baseline-policy on the CLI for non-interactive / CI use.
+  #
+  #   !! Do NOT set this to a local file path (e.g. "./baseline/file.xml") !!
+  #   The baseline is fetched live from the BIG-IP device; no local file is needed.
+  mode: ""                    # WAF | BOT | INSPECT  (leave blank for interactive selector)
   output_dir: "../f5_aWAF_Policy_Audit_output"
-  report_format: "both"       # html, markdown, both
-  export_format: "xml"
-  concurrent_exports: 3       # 1–20
-  partitions: []              # empty = all partitions
+  report_format: "both"       # html | markdown | both
+  pass_threshold: 90.0        # Green tier lower bound (0–100)
+  fail_on_tier: "RED"         # Exit non-zero if any policy reaches this tier or worse
 
 gitlab:
-  repo_url: "https://gitlab.example.com/netsec/policy-state.git"
+  repo_url: ""                # e.g. "https://gitlab.example.com/netsec/policy-state.git"
   local_dir: "../f5_aWAF_Policy_Audit_policy_state_repo"
   branch: "main"
   auto_push: false            # true = commit + push after each run
-  update_source_truth: false  # true = replace source_of_truth files with latest exports
+  update_source_truth: false  # true = replace source_of_truth files with latest API data
