@@ -12,7 +12,7 @@ import functools
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -240,6 +240,19 @@ class TierInfo:
     score: float
     is_hard_fail: bool
     circuit_breakers: list[str]
+
+
+# ── Violation ID alias table ───────────────────────────────────────────────────
+#
+# F5 BIG-IP renamed several violation machine IDs between software versions.
+# The XML export format preserves the *old* id= attribute while the iControl
+# REST API (/blocking-settings/violations) returns the *new* name.  Normalizing
+# at parse time ensures both XML baselines and REST targets use the same ID.
+_XML_VIOL_ID_ALIASES: Dict[str, str] = {
+    "MALFORMED_JSON": "MALFORMED_JSON_DATA",
+    "MALFORMED_GWT":  "MALFORMED_GWT_DATA",
+    "MALFORMED_XML":  "MALFORMED_XML_DATA",
+}
 
 
 def score_to_tier(score: float, circuit_breakers: Optional[List[str]] = None, green_threshold: float = 90.0) -> TierInfo:

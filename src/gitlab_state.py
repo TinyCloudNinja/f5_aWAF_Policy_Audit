@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .policy_parser import parse_policy
+from ._deprecated.policy_parser import parse_policy  # transitional: XML SoT fallback only
 from .utils import ensure_dir, get_logger, sanitize_filename
 
 
@@ -85,15 +85,32 @@ class GitLabStateManager:
     # ── Source-of-truth loading ────────────────────────────────────────────────
 
     def load_waf_source_of_truth(self, policy_full_path: str) -> Tuple[Optional[Dict], str]:
-        """Load and parse source-of-truth WAF policy XML from repo, if present."""
-        path = self._sot_file_path("waf", policy_full_path, "xml")
-        if not path.exists():
-            return None, ""
-        try:
-            return parse_policy(str(path)), f"gitlab:{path.relative_to(self.repo_dir)}"
-        except Exception as exc:
-            self.log.warning("Could not parse source-of-truth WAF file %s: %s", path, exc)
-            return None, ""
+        """Load source-of-truth WAF policy from repo, if present.
+
+        Tries JSON (new API-normalized format) first, then falls back to
+        XML (legacy export format).  Logs a migration hint on XML fallback.
+        """
+        json_path = self._sot_file_path("waf", policy_full_path, "json")
+        if json_path.exists():
+            try:
+                with json_path.open("r", encoding="utf-8") as fh:
+                    return json.load(fh), f"gitlab:{json_path.relative_to(self.repo_dir)}"
+            except Exception as exc:
+                self.log.warning("Could not read source-of-truth WAF JSON %s: %s", json_path, exc)
+
+        xml_path = self._sot_file_path("waf", policy_full_path, "xml")
+        if xml_path.exists():
+            self.log.info(
+                "Loading XML source-of-truth for %s (migrate to JSON by running an audit "
+                "with --gitlab-update-source-truth after upgrading to PolicyFetcher).",
+                policy_full_path,
+            )
+            try:
+                return parse_policy(str(xml_path)), f"gitlab:{xml_path.relative_to(self.repo_dir)}"
+            except Exception as exc:
+                self.log.warning("Could not parse source-of-truth WAF XML %s: %s", xml_path, exc)
+
+        return None, ""
 
     def load_bot_source_of_truth(self, profile_full_path: str) -> Tuple[Optional[Dict], str]:
         """Load source-of-truth Bot Defense profile JSON from repo, if present."""

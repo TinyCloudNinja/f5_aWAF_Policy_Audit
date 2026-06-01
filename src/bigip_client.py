@@ -1,22 +1,17 @@
 """
 BIG-IP iControl REST API client with token-based authentication,
-automatic token refresh, retry/backoff, and chunked file transfer.
+automatic token refresh, and retry/backoff.
 """
 import os
 import time
-import math
 import logging
 import threading
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
 import urllib3
 
 from .utils import get_logger, retry
-
-_CHUNK_SIZE    = 1_048_576    # 1 MiB — F5 file-transfer hard limit
-_MAX_DOWNLOAD  = 524_288_000  # 500 MiB — safety cap against unbounded streams
 
 
 class AuthenticationError(Exception):
@@ -35,7 +30,6 @@ class BigIPClient:
 
     _LOGIN_PATH = "/mgmt/shared/authn/login"
     _DEFAULT_TIMEOUT = 30
-    _TRANSFER_TIMEOUT = 120
 
     def __init__(
         self,
@@ -171,125 +165,33 @@ class BigIPClient:
         resp = self._request("GET", path, params=params)
         return resp.json()
 
+    def get_all(self, path: str, params: Optional[Dict] = None) -> list:
+        """Fetch all pages from a paged iControl REST collection.
+
+        Uses $top/$skip OData pagination until totalItems is exhausted.
+        Raises on HTTP errors; returns an empty list for empty collections.
+        """
+        params = dict(params or {})
+        params.setdefault("$top", 500)
+        items: list = []
+        skip = 0
+        while True:
+            params["$skip"] = skip
+            data = self.get(path, params=params)
+            page = data.get("items", [])
+            items.extend(page)
+            total = data.get("totalItems", len(items))
+            if len(items) >= total:
+                break
+            skip += len(page)
+            if not page:
+                break  # safety: prevent infinite loop on empty page response
+        return items
+
     def post(self, path: str, data: Optional[Dict] = None) -> Any:
         resp = self._request("POST", path, json=data)
         return resp.json()
 
-    # ── File transfer ──────────────────────────────────────────────────────────
-
-    def upload_file(self, path: str, filepath: str) -> None:
-        """
-        Upload a local file to BIG-IP using 1 MiB Content-Range chunks.
-        """
-        filepath = Path(filepath)
-        file_size = filepath.stat().st_size
-        chunks = math.ceil(file_size / _CHUNK_SIZE)
-
-        with open(filepath, "rb") as fh:
-            for chunk_index in range(chunks):
-                start = chunk_index * _CHUNK_SIZE
-                end = min(start + _CHUNK_SIZE, file_size) - 1
-                chunk = fh.read(_CHUNK_SIZE)
-                headers = {
-                    "Content-Type": "application/octet-stream",
-                    "Content-Range": f"{start}-{end}/{file_size}",
-                    "Content-Length": str(len(chunk)),
-                }
-                self._request(
-                    "POST",
-                    path,
-                    timeout=self._TRANSFER_TIMEOUT,
-                    data=chunk,
-                    headers=headers,
-                )
-                self.log.debug(
-                    "Uploaded chunk %d/%d for %s", chunk_index + 1, chunks, filepath.name
-                )
-
-    def download_file(
-        self,
-        path: str,
-        local_path: str,
-        expected_size: Optional[int] = None,
-    ) -> int:
-        """
-        Download a file from BIG-IP, handling the 1 MiB chunk limit.
-
-        The F5 ASM file-transfer endpoint returns at most 1,048,576 bytes per
-        request and does NOT include a Content-Range response header that reveals
-        the total file size.  Instead we loop until either:
-          - we receive fewer bytes than the chunk size (end of file), or
-          - total_written reaches expected_size (when provided by the caller).
-
-        Returns the total number of bytes written.
-        """
-        local_path = Path(local_path)
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-
-        total_written = 0
-        with open(local_path, "wb") as fh:
-            while True:
-                start = total_written
-                end   = start + _CHUNK_SIZE - 1
-                if expected_size:
-                    end = min(end, expected_size - 1)
-
-                resp = self._request(
-                    "GET",
-                    path,
-                    timeout=self._TRANSFER_TIMEOUT,
-                    headers={"Content-Range": f"{start}-{end}/*"},
-                )
-
-                chunk = resp.content
-                if not chunk:
-                    break
-
-                fh.write(chunk)
-                total_written += len(chunk)
-                self.log.debug(
-                    "Downloaded %d bytes (total so far: %d%s)",
-                    len(chunk),
-                    total_written,
-                    f" / {expected_size}" if expected_size else "",
-                )
-
-                # A partial chunk means we have reached the end of the file
-                if len(chunk) < _CHUNK_SIZE:
-                    break
-
-                # Safety guard when expected_size is known
-                if expected_size and total_written >= expected_size:
-                    break
-
-                # Hard cap — abort if response grows beyond the safety limit
-                if total_written >= _MAX_DOWNLOAD:
-                    raise requests.RequestException(
-                        f"Download of {path!r} exceeded the {_MAX_DOWNLOAD // 1_048_576} MiB "
-                        "safety limit. Aborting."
-                    )
-
-        self.log.debug("Download complete: %s (%d bytes)", local_path, total_written)
-        return total_written
-
     def close(self) -> None:
         self._password = ""
         self._session.close()
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _parse_content_range_total(header: str) -> Optional[int]:
-    """
-    Extract total size from Content-Range header.
-    E.g. 'bytes 0-1048575/3145728' → 3145728
-    """
-    if not header:
-        return None
-    parts = header.split('/')
-    if len(parts) == 2 and parts[1] != '*':
-        try:
-            return int(parts[1])
-        except ValueError:
-            pass
-    return None

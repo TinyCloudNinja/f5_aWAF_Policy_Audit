@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.policy_parser import parse_policy, get_policy_metadata
+from src._deprecated.policy_parser import parse_policy, get_policy_metadata
 from src.policy_comparator import (
     compare_policies,
     ComparisonResult,

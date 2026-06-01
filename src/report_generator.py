@@ -13,7 +13,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .policy_parser import _XML_VIOL_ID_ALIASES as _VIOL_ALIASES
+from .utils import _XML_VIOL_ID_ALIASES as _VIOL_ALIASES
 from .policy_comparator import (
     ComparisonResult,
     SEVERITY_CRITICAL,
