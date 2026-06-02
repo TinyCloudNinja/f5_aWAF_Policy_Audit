@@ -194,8 +194,13 @@ class TestComplianceScore:
         target_data   = parse_policy(BASELINE)   # same file
         meta          = get_policy_metadata(BASELINE)
         r = compare_policies(baseline_data, target_data, meta, "baseline.xml")
-        assert r.score == 100.0
+        # No drift between identical policies — zero DiffItems expected.
         assert r.diffs == []
+        # The fixture has Policy Builder in fully-automatic mode, so the
+        # standalone posture signal fires (-10 pts).  Score < 100 is correct.
+        assert r.has_hard_triggers is False
+        # Score reflects standalone signals only (no drift deductions).
+        assert r.score == r.raw_score
 
     def test_score_floor_at_zero(self):
         from src.policy_comparator import _calculate_score, DiffItem
