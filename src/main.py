@@ -49,7 +49,7 @@ from .interactive import (
 import urllib3
 
 
-_DEFAULT_PASS_THRESHOLD = 90.0  # Green lower bound for backward compatibility
+_DEFAULT_PASS_THRESHOLD = 85.0  # Aligned (Green) lower bound — matches new band definition
 _DEFAULT_FAIL_ON_TIER = TIER_RED
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_OUTPUT_DIR = str((_REPO_ROOT.parent / f"{_REPO_ROOT.name}_output").resolve())

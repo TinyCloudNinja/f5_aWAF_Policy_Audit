@@ -191,34 +191,34 @@ TIER_GREEN = "GREEN"
 _TIER_BANDS = [
     {
         "name": TIER_RED,
-        "label": "Non-Compliant",
+        "label": "Review Now",
         "emoji": "🔴",
         "color": "#dc3545",
         "min": 0,
-        "max": 49,
+        "max": 39,
     },
     {
         "name": TIER_AMBER,
-        "label": "Review Required",
+        "label": "Review Soon",
         "emoji": "🟠",
         "color": "#fd7e14",
-        "min": 50,
-        "max": 74,
+        "min": 40,
+        "max": 64,
     },
     {
         "name": TIER_YELLOW,
         "label": "Monitor",
         "emoji": "🟡",
         "color": "#ffc107",
-        "min": 75,
-        "max": 89,
+        "min": 65,
+        "max": 84,
     },
     {
         "name": TIER_GREEN,
-        "label": "Compliant",
+        "label": "Aligned",
         "emoji": "🟢",
         "color": "#28a745",
-        "min": 90,
+        "min": 85,
         "max": 100,
     },
 ]
@@ -226,7 +226,7 @@ _TIER_BANDS = [
 
 @dataclass(frozen=True)
 class TierInfo:
-    """Represents a compliance tier derived from a score.
+    """Represents a posture tier derived from a score.
 
     The tier calculation is pure and side-effect free, making it easy to unit test.
     The green threshold can be overridden for backward compatibility with the
@@ -238,8 +238,13 @@ class TierInfo:
     color: str
     emoji: str
     score: float
-    is_hard_fail: bool
+    has_hard_triggers: bool
     circuit_breakers: list[str]
+
+    @property
+    def is_hard_fail(self) -> bool:
+        """Backward-compatible alias for has_hard_triggers."""
+        return self.has_hard_triggers
 
 
 # ── Violation ID alias table ───────────────────────────────────────────────────
@@ -255,32 +260,32 @@ _XML_VIOL_ID_ALIASES: Dict[str, str] = {
 }
 
 
-def score_to_tier(score: float, circuit_breakers: Optional[List[str]] = None, green_threshold: float = 90.0) -> TierInfo:
-    """Map a numeric score to a tier.
+def score_to_tier(score: float, circuit_breakers: Optional[List[str]] = None, green_threshold: float = 85.0) -> TierInfo:
+    """Map a numeric Posture Score to a triage tier.
 
     Args:
-        score: Final compliance score (0–100 after any circuit breaker capping).
-        circuit_breakers: List of triggered circuit breaker names (empty if none).
-        green_threshold: Lower bound for the Green tier (default 90.0) to support
-            backward compatibility with the legacy --pass-threshold flag. Only the
-            Green/YELLOW boundary shifts; Amber/Red remain at 74/49 respectively.
+        score: Final Posture Score (0–100 after any hard-trigger capping).
+        circuit_breakers: List of triggered hard-trigger names (empty if none).
+        green_threshold: Lower bound for the Aligned (Green) tier; default 85.
+            Only the Aligned/Monitor boundary shifts when overridden — the
+            Review Soon/Review Now boundaries remain at 64/39 respectively.
 
     Returns:
-        TierInfo with name/label/color/emoji and whether any circuit breaker fired.
+        TierInfo with name/label/color/emoji and whether any hard trigger fired.
     """
 
     cb_list = circuit_breakers or []
-    # Adjust the yellow/green boundary if the caller overrides the green threshold.
-    bands = list(_TIER_BANDS)
-    if green_threshold != 90.0:
-        # Clamp to sane range
+    # Shallow-copy so we can adjust without mutating the module-level constant.
+    bands = [dict(b) for b in _TIER_BANDS]
+    if green_threshold != 85.0:
         g_min = max(0, min(100, green_threshold))
         for band in bands:
             if band["name"] == TIER_GREEN:
                 band["min"] = g_min
             if band["name"] == TIER_YELLOW:
-                band["max"] = max(74, g_min - 1)
-    # Select band
+                # Keep Monitor upper bound at least at the Review Soon max (64).
+                band["max"] = max(64, g_min - 1)
+    # Select band (bands[0] = Review Now is the default / lowest)
     chosen = bands[0]
     for band in bands:
         if band["min"] <= score <= band["max"]:
@@ -292,6 +297,6 @@ def score_to_tier(score: float, circuit_breakers: Optional[List[str]] = None, gr
         color=chosen["color"],
         emoji=chosen["emoji"],
         score=score,
-        is_hard_fail=bool(cb_list),
+        has_hard_triggers=bool(cb_list),
         circuit_breakers=cb_list,
     )

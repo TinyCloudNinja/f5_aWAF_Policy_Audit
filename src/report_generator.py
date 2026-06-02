@@ -66,7 +66,9 @@ def generate_markdown(result: ComparisonResult, output_dir: str) -> Path:
 
     lines: List[str] = []
     _md_header(lines, result)
-    _md_circuit_breakers(lines, result)
+    _md_hard_triggers(lines, result)
+    _md_contributing_factors(lines, result)
+    _md_drift_summary(lines, result)
     _md_deductions(lines, result)
     _md_waf_violations(lines, result)
     _md_audit_logs(lines, result)
@@ -86,16 +88,16 @@ def _md_header(lines: List[str], result: ComparisonResult) -> None:
     """
 
     tier_badge = f"{_TIER_EMOJI.get(result.tier, '')} {result.tier_label}"
-    if result.is_hard_fail:
+    if result.has_hard_triggers:
         score_line = f"{result.score:.1f}% (capped from raw {result.raw_score:.1f}%)"
     else:
         score_line = f"{result.score:.1f}%"
 
     lines += [
-        f"# Compliance Report for `{result.policy_path}`",
+        f"# Audit Report for `{result.policy_path}`",
         "",
-        f"- **Compliance Score:** {score_line}",
-        f"- **Tier:** **{tier_badge}**",
+        f"- **Posture Score:** {score_line}",
+        f"- **Status:** **{tier_badge}**",
         f"- **Partition:** {result.partition}",
         f"- **Current Enforcement Mode (device):** {result.enforcement_mode}",
         f"- **Baseline:** {result.baseline_name}",
@@ -104,18 +106,18 @@ def _md_header(lines: List[str], result: ComparisonResult) -> None:
     ]
 
 
-def _md_circuit_breakers(lines: List[str], result: ComparisonResult) -> None:
+def _md_hard_triggers(lines: List[str], result: ComparisonResult) -> None:
     if not result.circuit_breakers_triggered:
-        lines += ["## Circuit Breakers", "", "*None triggered.*", ""]
+        lines += ["## Hard Triggers", "", "*None active.*", ""]
         return
 
-    lines += ["## Circuit Breakers", ""]
+    lines += ["## Hard Triggers", ""]
     lines.append(
-        "The following circuit-breaker conditions cap the score at 49 regardless of other deductions:"
+        "The following conditions force **Review Now** status regardless of the Posture Score:"
     )
     lines.append("")
-    for cb in result.circuit_breakers_triggered:
-        lines.append(f"- `{cb}`")
+    for trigger in result.circuit_breakers_triggered:
+        lines.append(f"- {trigger}")
     lines.append("")
 
 
@@ -148,6 +150,56 @@ def _md_waf_violations(lines: List[str], result: ComparisonResult) -> None:
             f"{row['baseline_block']} | {row['target_block']} | {row['block_match']} | {row['overall']} |"
         )
     lines.append("")
+
+
+def _md_contributing_factors(lines: List[str], result: ComparisonResult) -> None:
+    factors = getattr(result, "contributing_factors", [])
+    lines += ["## Contributing Factors", ""]
+    if not factors:
+        lines += ["*No scoring factors recorded.*", ""]
+        return
+    lines.append("Ranked by impact on Posture Score (highest deduction first):")
+    lines.append("")
+    lines.append("| # | Factor | Points | Drift? | Remediation |")
+    lines.append("|---|--------|--------|--------|-------------|")
+    for i, f in enumerate(factors, 1):
+        drift_flag = "Yes" if f.get("is_drift") else "No"
+        ded = f.get("deduction", 0)
+        ded_str = f"−{ded:.0f}" if ded > 0 else "—"
+        label = str(f.get("label", "")).replace("|", "\\|")
+        remediation = str(f.get("remediation", "")).replace("|", "\\|")
+        lines.append(f"| {i} | {label} | {ded_str} | {drift_flag} | {remediation} |")
+    lines.append("")
+
+
+def _md_drift_summary(lines: List[str], result: ComparisonResult) -> None:
+    ds = getattr(result, "drift_summary", {})
+    lines += ["## Drift Summary", ""]
+    if not ds.get("baselined", True):
+        lines += [
+            "> **Drift tracking is unbaselined.** No baseline snapshot exists for this "
+            "policy. The Posture Score reflects standalone signals only. "
+            "Capture a baseline to enable drift detection.",
+            "",
+        ]
+        return
+    loosening = ds.get("loosening", [])
+    tightening = ds.get("tightening", [])
+    lines.append(
+        f"**{len(loosening)}** loosening change(s) counted against the score, "
+        f"**{len(tightening)}** tightening change(s) ignored."
+    )
+    lines.append("")
+    if loosening:
+        lines.append("### Loosening changes (count against score)")
+        for desc in loosening:
+            lines.append(f"- {desc}")
+        lines.append("")
+    if tightening:
+        lines.append("### Tightening changes (ignored for score)")
+        for desc in tightening:
+            lines.append(f"- {desc}")
+        lines.append("")
 
 
 def _md_deductions(lines: List[str], result: ComparisonResult) -> None:
@@ -289,7 +341,7 @@ def generate_html_dashboard(
         policy_id = f"policy-{idx}"
         tier_cls = _TIER_CLASS.get(r.tier, "")
         cb_col = ", ".join(r.circuit_breakers_triggered) if r.circuit_breakers_triggered else "—"
-        raw_col = f"{r.raw_score:.1f}" if r.is_hard_fail else "—"
+        raw_col = f"{r.raw_score:.1f}" if r.has_hard_triggers else "—"
 
         mode_text = (r.enforcement_mode or "transparent").strip().lower()
         mode_is_blocking = "block" in mode_text
@@ -297,8 +349,8 @@ def generate_html_dashboard(
         mode_cls = "mode-blocking" if mode_is_blocking else "mode-transparent"
         status_label = r.tier_label
 
-        compliance_label = "Compliant" if r.score >= 90.0 else "Needs Review"
-        compliance_cls = "status-compliant" if compliance_label == "Compliant" else "status-review"
+        compliance_label = "Aligned" if r.score >= 85.0 else "Needs Attention"
+        compliance_cls = "status-compliant" if compliance_label == "Aligned" else "status-review"
         ports = sorted({str(v.get("port", "")).strip() for v in (r.virtual_servers or []) if str(v.get("port", "")).strip()})
         ports_label = ", ".join(ports) if ports else "None"
 
@@ -340,8 +392,8 @@ def generate_html_dashboard(
         "</div>"
     )
 
-    pass_count = sum(1 for r in ordered if r.score >= 90.0)
-    fail_count = len(ordered) - pass_count
+    pass_count = sum(1 for r in ordered if r.score >= 85.0)
+    needs_attention_count = len(ordered) - pass_count
 
     summary_content = (
         "<section id='summary-view' class='view active' role='region' aria-label='Summary'>"
@@ -351,7 +403,7 @@ def generate_html_dashboard(
                 "<h2 class='sec-h2'>Policy Compliance Summary</h2>"
                 "<table class='results'>"
                 "<thead><tr>"
-                "<th>Policy Name</th><th>Tier</th><th>Score (%)</th><th>Raw Score</th><th>Circuit Breakers</th>"
+                "<th>Policy Name</th><th>Tier</th><th>Score (%)</th><th>Raw Score</th><th>Hard Triggers</th>"
                 "<th>Critical</th><th>High</th><th>Warning</th><th>Info</th>"
                 "</tr></thead><tbody>"
                 + "".join(rows)
@@ -367,7 +419,7 @@ def generate_html_dashboard(
                 f"{summary_bar}"
                 "<table class='results'>"
                 "<thead><tr>"
-                "<th>Policy/Profile</th><th>Tier</th><th>Score</th><th>Raw Score</th><th>Circuit Breakers</th>"
+                "<th>Policy/Profile</th><th>Tier</th><th>Score</th><th>Raw Score</th><th>Hard Triggers</th>"
                 "<th>Critical</th><th>High</th><th>Warning</th><th>Info</th>"
                 "</tr></thead><tbody>"
                 + "".join(rows)
@@ -386,8 +438,8 @@ def generate_html_dashboard(
         f"<tr><th>Audit Mode</th><td>{'BOT' if is_bot else 'WAF'}</td></tr>"
         f"<tr><th>Run Timestamp</th><td>{_esc(audit_timestamp)}</td></tr>"
         f"<tr><th>Total Objects Audited</th><td>{len(ordered)}</td></tr>"
-        f"<tr><th>Pass Count (&ge;90%)</th><td>{pass_count}</td></tr>"
-        f"<tr><th>Fail Count (&lt;90%)</th><td>{fail_count}</td></tr>"
+        f"<tr><th>Aligned (&ge;85%)</th><td>{pass_count}</td></tr>"
+        f"<tr><th>Needs Attention (&lt;85%)</th><td>{needs_attention_count}</td></tr>"
         "</tbody></table>"
         "</section>"
     )
@@ -410,7 +462,7 @@ def generate_html_dashboard(
         f"<div><strong>Device:</strong> {_esc(device_hostname)} ({_esc(device_mgmt_ip)})</div>"
         f"<div><strong>Mode:</strong> {mode_label}</div>"
         f"<div><strong>Generated:</strong> {_esc(audit_timestamp)}</div>"
-        f"<div><strong>Pass/Fail:</strong> {pass_count}/{fail_count}</div>"
+        f"<div><strong>Aligned/Needs Attention:</strong> {pass_count}/{needs_attention_count}</div>"
         "</div>"
         "</header>"
         "<div class='body-grid'>"
@@ -707,6 +759,77 @@ def _esc(val) -> str:
     return html.escape(str(val))
 
 
+def _build_contributing_factors_html(result: ComparisonResult) -> str:
+    factors = getattr(result, "contributing_factors", [])
+    if not factors:
+        return ""
+    rows = ""
+    for i, f in enumerate(factors, 1):
+        ded = f.get("deduction", 0)
+        ded_str = f"−{ded:.0f}" if ded > 0 else "—"
+        drift_badge = (
+            "<span class='badge badge-warning'>Drift</span>"
+            if f.get("is_drift") else ""
+        )
+        rows += (
+            "<tr>"
+            f"<td>{i}</td>"
+            f"<td>{_esc(f.get('label', ''))}</td>"
+            f"<td><strong>{ded_str}</strong></td>"
+            f"<td>{drift_badge}</td>"
+            f"<td>{_esc(f.get('description', ''))}</td>"
+            f"<td>{_esc(f.get('remediation', ''))}</td>"
+            "</tr>"
+        )
+    return (
+        "<h2 class='sec-h2'>Contributing Factors</h2>"
+        "<table class='findings'><thead><tr>"
+        "<th>#</th><th>Factor</th><th>Points</th><th>Drift?</th>"
+        "<th>Detail</th><th>Remediation</th>"
+        "</tr></thead><tbody>"
+        + rows
+        + "</tbody></table>"
+    )
+
+
+def _build_drift_summary_html(result: ComparisonResult) -> str:
+    ds = getattr(result, "drift_summary", {})
+    if not ds:
+        return ""
+    if not ds.get("baselined", True):
+        return (
+            "<h2 class='sec-h2'>Drift Summary</h2>"
+            "<div class='pb-banner pb-manual'>"
+            "<span class='g'>&#9888;</span>"
+            "<span><strong>Drift tracking is unbaselined.</strong> "
+            "No baseline snapshot is available for this policy. "
+            "The Posture Score reflects standalone signals only. "
+            "Capture a baseline to enable drift detection.</span>"
+            "</div>"
+        )
+    loosening = ds.get("loosening", [])
+    tightening = ds.get("tightening", [])
+    loose_html = "".join(f"<li>{_esc(d)}</li>" for d in loosening) or "<li><em>None</em></li>"
+    tight_html = "".join(f"<li>{_esc(d)}</li>" for d in tightening) or "<li><em>None</em></li>"
+    return (
+        "<h2 class='sec-h2'>Drift Summary</h2>"
+        "<div class='disclose open'>"
+        "<div class='disclose-sum'>"
+        f"<span class='caret'>&#9654;</span>"
+        f"<span class='badge badge-critical'>Loosening ({len(loosening)})</span>"
+        "&nbsp;changes counted against score"
+        "</div>"
+        "<div class='disclose-body'><ul>" + loose_html + "</ul></div></div>"
+        "<div class='disclose'>"
+        "<div class='disclose-sum'>"
+        f"<span class='caret'>&#9654;</span>"
+        f"<span class='badge badge-info'>Tightening ({len(tightening)})</span>"
+        "&nbsp;changes ignored for score"
+        "</div>"
+        "<div class='disclose-body'><ul>" + tight_html + "</ul></div></div>"
+    )
+
+
 def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "") -> str:
     """Render a per-policy detail block — always expanded, no collapsible elements."""
     sev_order = [SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_WARNING, SEVERITY_INFO]
@@ -717,7 +840,7 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
         SEVERITY_INFO: "Informational",
     }
 
-    raw_score = f"{result.raw_score:.1f}%" if result.is_hard_fail else "—"
+    raw_score = f"{result.raw_score:.1f}%" if result.has_hard_triggers else "—"
     cb_text = ", ".join(result.circuit_breakers_triggered) if result.circuit_breakers_triggered else "None"
 
     mode_text = (result.enforcement_mode or "transparent").strip().lower()
@@ -726,9 +849,9 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
     mode_cls = "mode-blocking" if mode_is_blocking else "mode-transparent"
     enforcement_badge = f"<span class='pill {mode_cls}'>{mode_label}</span>"
     learning_badge = _learning_mode_badge(getattr(result, "learning_mode", ""))
-    pass_flag = result.score >= 90.0
-    score_badge = f"<span class='badge badge-{'pass' if pass_flag else 'fail'}'>{'PASS' if pass_flag else 'FAIL'}</span>"
-    compliance_label = "Compliant" if pass_flag else "Needs Review"
+    pass_flag = result.score >= 85.0
+    score_badge = f"<span class='badge badge-{'pass' if pass_flag else 'review'}'>{'Aligned' if pass_flag else 'Needs Attention'}</span>"
+    compliance_label = "Aligned" if pass_flag else "Needs Attention"
     compliance_cls = "status-compliant" if pass_flag else "status-review"
 
     # Meta card with score bar
@@ -740,11 +863,11 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
         f"<td>Audit Date</td><td>{_esc(result.timestamp)}</td></tr>",
         f"<tr><td>Learning Mode</td><td>{learning_badge}</td>",
         f"<td>Raw Score</td><td>{raw_score}</td></tr>",
-        f"<tr><td>Circuit Breakers</td><td>{_esc(cb_text)}</td>",
-        f"<td>Compliance Score</td><td><strong>{result.score:.1f}%</strong> {score_badge}</td></tr>",
+        f"<tr><td>Hard Triggers</td><td>{_esc(cb_text)}</td>",
+        f"<td>Posture Score</td><td><strong>{result.score:.1f}%</strong> {score_badge}</td></tr>",
         f"<tr><td>Status</td><td><span class='pill {compliance_cls}'>{compliance_label}</span></td><td></td><td></td></tr>",
         "</tbody></table>",
-        f"<div class='score-bar'><div class='score-fill {'score-pass' if pass_flag else 'score-fail'}' style='width:{result.score:.1f}%'></div></div>",
+        f"<div class='score-bar'><div class='score-fill {'score-pass' if pass_flag else 'score-review'}' style='width:{result.score:.1f}%'></div></div>",
         "</div>",
     ])
 
@@ -803,6 +926,8 @@ def _build_legacy_policy_section(result: ComparisonResult, section_id: str = "")
     parts: List[str] = [
         f"<div class='legacy-policy-panel'{id_attr}>",
         meta_card,
+        _build_contributing_factors_html(result),
+        _build_drift_summary_html(result),
     ]
 
     if is_waf:
@@ -1263,6 +1388,7 @@ body{font-family:Arial,Helvetica,sans-serif;background:#f7f7fb;color:#222}
 .badge-info{background:#17a2b8}
 .badge-pass{background:#28a745}
 .badge-fail{background:#dc3545}
+.badge-review{background:#fd7e14}
 .badge-unknown{background:#6c757d}
 /* ---- Pills -------------------------------------------------------------- */
 .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
@@ -1285,6 +1411,7 @@ body{font-family:Arial,Helvetica,sans-serif;background:#f7f7fb;color:#222}
 .score-fill{height:100%;transition:width .5s ease}
 .score-pass{background:#28a745}
 .score-fail{background:#dc3545}
+.score-review{background:#fd7e14}
 /* ---- Headings ----------------------------------------------------------- */
 h1{font-size:1.3rem;color:#1a1a2e;margin:0 0 12px}
 h2{margin:16px 0 8px}
@@ -1387,11 +1514,11 @@ def _write_summary_md(results: List[ComparisonResult], reports_dir: Path) -> Non
     is_bot = any(getattr(r, "profile_type", "waf") == "bot" for r in results)
     title = "# Bot Defense Profile Audit — Summary" if is_bot else "# WAF Policy Audit — Summary"
     lines = [title, "", "Policies sorted by score (lowest first).", ""]
-    lines.append("| Policy/Profile | Tier | Score | Raw Score | Circuit Breakers | Critical | High | Warning | Info |")
+    lines.append("| Policy/Profile | Tier | Score | Raw Score | Hard Triggers | Critical | High | Warning | Info |")
     lines.append("|----------------|------|-------|-----------|------------------|---------|------|---------|------|")
     for r in results:
         cb = ", ".join(r.circuit_breakers_triggered) if r.circuit_breakers_triggered else "—"
-        raw = f"{r.raw_score:.1f}" if r.is_hard_fail else "—"
+        raw = f"{r.raw_score:.1f}" if r.has_hard_triggers else "—"
         lines.append(
             f"| `{r.policy_path}` | {_TIER_EMOJI.get(r.tier, '')} {r.tier_label} "
             f"| {r.score:.1f} | {raw} | {cb} | "
@@ -1416,7 +1543,7 @@ def _write_summary_html(results: List[ComparisonResult], reports_dir: Path) -> N
     for r in results:
         tier_cls = _TIER_CLASS.get(r.tier, "")
         cb = ", ".join(r.circuit_breakers_triggered) if r.circuit_breakers_triggered else "—"
-        raw = f"{r.raw_score:.1f}" if r.is_hard_fail else "—"
+        raw = f"{r.raw_score:.1f}" if r.has_hard_triggers else "—"
         rows.append(
             f"<tr class='{tier_cls}'>"
             f"<td><code>{_esc(r.policy_path)}</code></td>"
@@ -1439,7 +1566,7 @@ def _write_summary_html(results: List[ComparisonResult], reports_dir: Path) -> N
         f"<h1>{title}</h1>"
         "<table class='results'>"
         "<thead><tr>"
-        "<th>Policy/Profile</th><th>Tier</th><th>Score</th><th>Raw Score</th><th>Circuit Breakers</th>"
+        "<th>Policy/Profile</th><th>Tier</th><th>Score</th><th>Raw Score</th><th>Hard Triggers</th>"
         "<th>Critical</th><th>High</th><th>Warning</th><th>Info</th>"
         "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
         "</body></html>"
