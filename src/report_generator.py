@@ -330,7 +330,6 @@ def generate_html_dashboard(
     device_mgmt_ip = next(iter(mgmt_ips)) if len(mgmt_ips) == 1 else ("Multiple IPs" if mgmt_ips else "Unknown")
     audit_timestamp = max(timestamps) if timestamps else "Unknown"
 
-    rows: List[str] = []
     nav_items = [
         "<button type='button' class='nav-item active' data-view='summary-view'>Summary</button>",
         "<div class='nav-group-title'>Policies</div>",
@@ -362,19 +361,6 @@ def generate_html_dashboard(
         )
         policy_path_to_id[str(r.policy_path)] = policy_id
 
-        rows.append(
-            "<tr class='" + tier_cls + "'>"
-            f"<td>{_esc(r.policy_path)}</td>"
-            f"<td>{_TIER_EMOJI.get(r.tier, '')} {r.tier_label}</td>"
-            f"<td>{r.score:.1f}</td>"
-            f"<td>{raw_col}</td>"
-            f"<td>{cb_col}</td>"
-            f"<td>{len([d for d in r.findings if d.severity==SEVERITY_CRITICAL])}</td>"
-            f"<td>{len([d for d in r.findings if d.severity==SEVERITY_HIGH])}</td>"
-            f"<td>{len([d for d in r.findings if d.severity==SEVERITY_WARNING])}</td>"
-            f"<td>{len([d for d in r.findings if d.severity==SEVERITY_INFO])}</td>"
-            "</tr>"
-        )
         policy_templates.append(
             f"<template id='tpl-{policy_id}'>"
             f"{_build_legacy_policy_section(r, section_id=policy_id)}"
@@ -383,48 +369,16 @@ def generate_html_dashboard(
 
     nav_items.append("<button type='button' class='nav-item' data-view='run-info-view'>Run Info</button>")
 
-    summary_bar = (
-        f"<div class='summary-bar'>"
-        f"<span class='tier-red'>🔴 Red: {counts[TIER_RED]}</span>"
-        f"<span class='tier-amber'>🟠 Amber: {counts[TIER_AMBER]}</span>"
-        f"<span class='tier-yellow'>🟡 Yellow: {counts[TIER_YELLOW]}</span>"
-        f"<span class='tier-green'>🟢 Green: {counts[TIER_GREEN]}</span>"
-        "</div>"
-    )
-
     pass_count = sum(1 for r in ordered if r.score >= 85.0)
     needs_attention_count = len(ordered) - pass_count
 
     summary_content = (
         "<section id='summary-view' class='view active' role='region' aria-label='Summary'>"
-        + (
-            (
-                f"{summary_bar}"
-                "<h2 class='sec-h2'>Policy Compliance Summary</h2>"
-                "<table class='results'>"
-                "<thead><tr>"
-                "<th>Policy Name</th><th>Tier</th><th>Score (%)</th><th>Raw Score</th><th>Hard Triggers</th>"
-                "<th>Critical</th><th>High</th><th>Warning</th><th>Info</th>"
-                "</tr></thead><tbody>"
-                + "".join(rows)
-                + "</tbody></table>"
-                + _build_virtual_server_summary_section(
-                    virtual_server_inventory=virtual_server_inventory or [],
-                    inventory_error=virtual_server_inventory_error,
-                    policy_path_to_id=policy_path_to_id,
-                )
-            )
-            if not is_bot
-            else (
-                f"{summary_bar}"
-                "<table class='results'>"
-                "<thead><tr>"
-                "<th>Policy/Profile</th><th>Tier</th><th>Score</th><th>Raw Score</th><th>Hard Triggers</th>"
-                "<th>Critical</th><th>High</th><th>Warning</th><th>Info</th>"
-                "</tr></thead><tbody>"
-                + "".join(rows)
-                + "</tbody></table>"
-            )
+        + _build_enforcement_summary_section(
+            results=ordered,
+            virtual_server_inventory=virtual_server_inventory or [],
+            inventory_error=virtual_server_inventory_error,
+            policy_path_to_id=policy_path_to_id,
         )
         + "</section>"
     )
@@ -553,7 +507,6 @@ def generate_html_dashboard(
         "rows.sort(function(a,b){"
         "var av=(a.getAttribute('data-'+col)||'').toLowerCase();"
         "var bv=(b.getAttribute('data-'+col)||'').toLowerCase();"
-        "if(col==='attached'){var an=parseInt(av||'0',10),bn=parseInt(bv||'0',10); return asc?an-bn:bn-an;}"
         "return asc?av.localeCompare(bv):bv.localeCompare(av);"
         "});"
         "rows.forEach(function(r){body.appendChild(r); var rid=r.getAttribute('data-row-id'); var dr=document.getElementById('vs-detail-'+rid); if(dr){body.appendChild(dr);}});"
@@ -569,18 +522,18 @@ def generate_html_dashboard(
     return out_path
 
 
-def _build_virtual_server_summary_section(
+def _build_enforcement_summary_section(
+    results: List[ComparisonResult],
     virtual_server_inventory: List[VirtualServerRecord],
     inventory_error: Optional[str],
     policy_path_to_id: Dict[str, str],
 ) -> str:
-    def _status_meta(status: str) -> tuple[str, str]:
-        if status == "enabled":
-            return ("WAF Enabled", "status-enabled")
-        if status == "capable":
-            return ("WAF Capable", "status-capable")
-        return ("Not Applicable", "status-na")
+    """Build the single consolidated WAF/Bot enforcement table for the Summary tab.
 
+    One row per policy-VS pairing.  Direct attachments and LTM-policy-routed
+    attachments are both expanded into individual rows.  Policies not bound to
+    any VS in the inventory appear with VS = "Not applied" / Destination = "—".
+    """
     if inventory_error:
         return (
             "<div class='pb-banner pb-disabled' role='alert'>"
@@ -590,129 +543,112 @@ def _build_virtual_server_summary_section(
             "</div>"
         )
 
-    records = virtual_server_inventory or []
+    result_by_path: Dict[str, ComparisonResult] = {
+        str(r.policy_path): r for r in (results or [])
+    }
+
+    def _mode_badge(mode: Optional[str]) -> tuple[str, str]:
+        if not mode:
+            return ("—", "")
+        m = mode.strip().lower()
+        if "block" in m:
+            return ("<span class='pill mode-blocking'>Blocking</span>", "blocking")
+        return ("<span class='pill mode-transparent'>Transparent</span>", "transparent")
+
+    seen: set = set()
     rows: List[str] = []
-    for idx, rec in enumerate(records):
+
+    def _add_row(policy_path: str, vs_display: str, destination: str) -> None:
+        res = result_by_path.get(policy_path)
+        mode_html, mode_sort = _mode_badge(res.enforcement_mode if res else None)
+        tier_display = (
+            f"{_TIER_EMOJI.get(res.tier, '')} {res.tier_label}".strip()
+            if res else "—"
+        )
+        tier_sort = res.tier_label if res else ""
+        tier_cls = _TIER_CLASS.get(res.tier, "") if res else ""
+
+        if policy_path in policy_path_to_id:
+            pol_cell = (
+                f"<a href='#' class='policy-jump' data-policy-path='{_esc(policy_path)}'>"
+                f"{_esc(policy_path)}</a>"
+            )
+        else:
+            pol_cell = _esc(policy_path)
+
+        search_blob = " ".join(
+            x for x in [policy_path, mode_sort, vs_display, tier_sort, destination] if x
+        )
+        rows.append(
+            f"<tr class='vs-row'"
+            f" data-row-id='{len(rows)}'"
+            f" data-search='{_esc(search_blob)}'"
+            f" data-policy='{_esc(policy_path)}'"
+            f" data-mode='{_esc(mode_sort)}'"
+            f" data-vs='{_esc(vs_display)}'"
+            f" data-tier='{_esc(tier_sort)}'"
+            f" data-destination='{_esc(destination)}'>"
+            f"<td>{pol_cell}</td>"
+            f"<td>{mode_html}</td>"
+            f"<td>{_esc(vs_display)}</td>"
+            f"<td><span class='pill {tier_cls}'>{_esc(tier_display)}</span></td>"
+            f"<td>{_esc(destination)}</td>"
+            "</tr>"
+        )
+
+    for rec in (virtual_server_inventory or []):
         source: Any = asdict(rec) if is_dataclass(rec) else rec
         if not isinstance(source, dict):
             continue
 
-        name = str(source.get("name") or "")
-        partition = str(source.get("partition") or "")
+        vs_display = str(source.get("full_path") or source.get("name") or "—")
         destination = str(source.get("destination") or "—")
-        http_profile = str(source.get("http_profile") or "—")
         direct = list(source.get("directly_attached_waf_policies") or [])
-        ltm_policies = list(source.get("ltm_policies") or [])
-        ltm_rule_count = sum(len((p or {}).get("rules") or []) for p in ltm_policies if isinstance(p, dict))
-        total_policies = len(direct) + ltm_rule_count
-        status_raw = str(source.get("waf_status") or "not_applicable")
-        status_label, status_cls = _status_meta(status_raw)
-        has_expand = status_raw == "enabled" and total_policies > 0
+        ltm_list = list(source.get("ltm_policies") or [])
 
-        search_blob = " ".join([name, partition, destination, http_profile, status_label] + [str(p) for p in direct])
-        attached_label = str(total_policies) if total_policies else "—"
+        for pol in direct:
+            p = str(pol)
+            key = (p, vs_display)
+            if key not in seen:
+                seen.add(key)
+                _add_row(p, vs_display, destination)
 
-        toggle_html = (
-            f"<button type='button' class='vs-toggle' aria-expanded='false' data-row-id='{idx}' title='Toggle details'>+</button>"
-            if has_expand else ""
-        )
-
-        rows.append(
-            "<tr class='vs-row'"
-            f" data-row-id='{idx}'"
-            f" data-search='{_esc(search_blob)}'"
-            f" data-name='{_esc(name)}'"
-            f" data-partition='{_esc(partition)}'"
-            f" data-destination='{_esc(destination)}'"
-            f" data-http_profile='{_esc(http_profile)}'"
-            f" data-status='{_esc(status_label)}'"
-            f" data-attached='{total_policies}'>"
-            f"<td class='expand-col'>{toggle_html}</td>"
-            f"<td>{_esc(name)}</td>"
-            f"<td>{_esc(partition)}</td>"
-            f"<td>{_esc(destination)}</td>"
-            f"<td>{_esc(http_profile)}</td>"
-            f"<td><span class='status-badge {status_cls}'>{_esc(status_label)}</span></td>"
-            f"<td>{_esc(attached_label)}</td>"
-            "</tr>"
-        )
-
-        if has_expand:
-            direct_lines = []
-            for pol in direct:
-                p = str(pol)
-                if p in policy_path_to_id:
-                    direct_lines.append(f"<li><a href='#' class='policy-jump' data-policy-path='{_esc(p)}'>{_esc(p)}</a></li>")
-                else:
-                    direct_lines.append(f"<li>{_esc(p)}</li>")
-            direct_html = "<ul>" + ("".join(direct_lines) if direct_lines else "<li>None</li>") + "</ul>"
-
-            routed_rows: List[str] = []
-            for policy in ltm_policies:
-                if not isinstance(policy, dict):
+        for ltm_pol in ltm_list:
+            if not isinstance(ltm_pol, dict):
+                continue
+            for rule in (ltm_pol.get("rules") or []):
+                if not isinstance(rule, dict):
                     continue
-                ltm_name = str(policy.get("full_path") or policy.get("name") or "(unresolved)")
-                for rule in (policy.get("rules") or []):
-                    if not isinstance(rule, dict):
-                        continue
-                    waf_policy = str(rule.get("waf_policy") or "(unresolved)")
-                    if waf_policy in policy_path_to_id:
-                        waf_cell = f"<a href='#' class='policy-jump' data-policy-path='{_esc(waf_policy)}'>{_esc(waf_policy)}</a>"
-                    else:
-                        waf_cell = _esc(waf_policy)
-                    host_conditions = rule.get("host_conditions") or ["(any)"]
-                    for host in host_conditions:
-                        routed_rows.append(
-                            "<tr>"
-                            f"<td>{_esc(host)}</td>"
-                            f"<td>{_esc(ltm_name)}</td>"
-                            f"<td>{_esc(rule.get('rule_name') or '(unnamed rule)')}</td>"
-                            f"<td>{waf_cell}</td>"
-                            "</tr>"
-                        )
+                waf_policy = str(rule.get("waf_policy") or "")
+                if not waf_policy:
+                    continue
+                key = (waf_policy, vs_display)
+                if key not in seen:
+                    seen.add(key)
+                    _add_row(waf_policy, vs_display, destination)
 
-            routed_html = (
-                "<table class='results nested'>"
-                "<thead><tr><th>Host (FQDN)</th><th>LTM Policy</th><th>Rule</th><th>WAF Policy</th></tr></thead>"
-                f"<tbody>{''.join(routed_rows) if routed_rows else '<tr><td colspan=4>None</td></tr>'}</tbody>"
-                "</table>"
-            )
+    seen_policies = {p for (p, _) in seen}
+    for r in (results or []):
+        if str(r.policy_path) not in seen_policies:
+            _add_row(str(r.policy_path), "Not applied", "—")
 
-            rows.append(
-                f"<tr id='vs-detail-{idx}' class='vs-detail-row' hidden>"
-                "<td colspan='7'>"
-                "<div class='vs-detail-panel'>"
-                "<h4>Direct attachments</h4>"
-                f"{direct_html}"
-                "<h4>LTM-Policy-routed attachments</h4>"
-                f"{routed_html}"
-                "</div>"
-                "</td></tr>"
-            )
-
+    no_data = "<tr><td colspan='5' class='muted'>No WAF or Bot policies found.</td></tr>"
     return (
-        "<h1>WAF Audit Summary</h1>"
-        "<div class='pb-banner pb-manual'>"
-        "<span class='g'>&#9888;</span>"
-        "<span>Virtual Server inventory is read-only and reflects ASM/AWAF applicability at audit time. "
-        "Expand a row to see policy attachments.</span>"
-        "</div>"
-        "<h2 class='sec-h2'>Virtual Server Summary</h2>"
+        "<h2 class='sec-h2'>WAF / Bot Policy Enforcement Summary</h2>"
         "<div class='vs-controls'>"
         "<label for='vs-filter'>Filter:</label>"
-        "<input id='vs-filter' type='text' placeholder='Search virtual servers, partitions, destination, or policy'>"
+        "<input id='vs-filter' type='text' "
+        "placeholder='Search policy, enforcement mode, virtual server, or destination'>"
         "</div>"
-        "<table id='vs-summary-table' class='results' aria-label='Virtual Server Summary'>"
+        "<table id='vs-summary-table' class='results' aria-label='WAF Policy Enforcement Summary'>"
         "<thead><tr>"
-        "<th></th>"
-        "<th><button type='button' class='sort-btn' data-col='name'>Virtual Server</button></th>"
-        "<th><button type='button' class='sort-btn' data-col='partition'>Partition</button></th>"
-        "<th><button type='button' class='sort-btn' data-col='destination'>Destination</button></th>"
-        "<th><button type='button' class='sort-btn' data-col='http_profile'>HTTP Profile</button></th>"
-        "<th><button type='button' class='sort-btn' data-col='status'>WAF Status</button></th>"
-        "<th><button type='button' class='sort-btn' data-col='attached'>Attached WAF Policies</button></th>"
+        "<th><button type='button' class='sort-btn' data-col='policy'>Policy Name</button></th>"
+        "<th><button type='button' class='sort-btn' data-col='mode'>Enforcement Mode</button></th>"
+        "<th><button type='button' class='sort-btn' data-col='vs'>Virtual Server</button></th>"
+        "<th><button type='button' class='sort-btn' data-col='tier'>Tier Status</button></th>"
+        "<th><button type='button' class='sort-btn' data-col='destination'>Destination IP</button></th>"
         "</tr></thead>"
-        f"<tbody id='vs-summary-body'>{''.join(rows) if rows else '<tr><td colspan=7>No virtual servers found.</td></tr>'}</tbody>"
+        f"<tbody id='vs-summary-body'>{''.join(rows) if rows else no_data}</tbody>"
         "</table>"
     )
 
