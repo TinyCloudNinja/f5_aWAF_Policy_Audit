@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 import pytest
 
+from src.bot_defense_comparator import _canonical_override_entry
 from src.bot_defense_scorer import (
     score_bot_profile,
     _detect_no_teeth,
@@ -845,3 +846,106 @@ def test_no_fail_language_anywhere():
     assert "fail" not in all_text.lower(), (
         f"'fail' found in scorer output: {all_text}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Override entry noise-field stripping (regression: generation / selfLink
+# false positives on semantically identical entries from different profiles)
+# ---------------------------------------------------------------------------
+
+class TestCanonicalOverrideEntry:
+    """_canonical_override_entry strips API noise fields before comparison."""
+
+    _WHITELIST_BASELINE = {
+        "kind": "tm:security:bot-defense:profile:whitelist:whiteliststate",
+        "name": "apple_touch_1",
+        "fullPath": "apple_touch_1",
+        "generation": 1002,
+        "selfLink": "https://localhost/mgmt/tm/security/bot-defense/profile/~Common~BST_Bot_v1/whitelist/apple_touch_1?ver=17.5.1.5",
+        "disableMitigation": "yes",
+        "disableVerification": "yes",
+        "matchOrder": 2,
+        "sourceAddress": "::/32",
+        "url": "/apple-touch-icon*.png",
+    }
+    _WHITELIST_TARGET = {
+        "kind": "tm:security:bot-defense:profile:whitelist:whiteliststate",
+        "name": "apple_touch_1",
+        "fullPath": "apple_touch_1",
+        "generation": 1022,
+        "selfLink": "https://localhost/mgmt/tm/security/bot-defense/profile/~Common~app1.siterequest.com/whitelist/apple_touch_1?ver=17.5.1.5",
+        "disableMitigation": "yes",
+        "disableVerification": "yes",
+        "matchOrder": 2,
+        "sourceAddress": "::/32",
+        "url": "/apple-touch-icon*.png",
+    }
+
+    def test_identical_semantic_content_compares_equal(self):
+        """Entries that differ only in generation/selfLink must compare equal."""
+        assert _canonical_override_entry(self._WHITELIST_BASELINE) == \
+               _canonical_override_entry(self._WHITELIST_TARGET)
+
+    def test_generation_stripped(self):
+        assert "generation" not in _canonical_override_entry(self._WHITELIST_BASELINE)
+
+    def test_selflink_stripped(self):
+        assert "selfLink" not in _canonical_override_entry(self._WHITELIST_BASELINE)
+
+    def test_kind_stripped(self):
+        assert "kind" not in _canonical_override_entry(self._WHITELIST_BASELINE)
+
+    def test_security_fields_preserved(self):
+        canon = _canonical_override_entry(self._WHITELIST_BASELINE)
+        assert canon["disableMitigation"] == "yes"
+        assert canon["disableVerification"] == "yes"
+        assert canon["sourceAddress"] == "::/32"
+        assert canon["url"] == "/apple-touch-icon*.png"
+        assert canon["name"] == "apple_touch_1"
+
+    def test_no_false_positive_from_generation_drift(self):
+        """Scoring two identical profiles must produce zero drift findings."""
+        baseline = _blocking_profile()
+        baseline["whitelistReference"] = {"items": [dict(self._WHITELIST_BASELINE)]}
+
+        target = _blocking_profile()
+        target["whitelistReference"] = {"items": [dict(self._WHITELIST_TARGET)]}
+
+        result = score_bot_profile(
+            target=target,
+            baseline=baseline,
+            vs_list=_vs_list(),
+            profile_meta=_meta(),
+        )
+        drift_findings = [
+            d for d in result.diffs
+            if d.section == "bot-defense.overrides.whitelist"
+            and d.attribute == "content"
+        ]
+        assert drift_findings == [], (
+            "Whitelist entries identical except for generation/selfLink must "
+            f"not produce drift findings. Got: {drift_findings}"
+        )
+
+    def test_real_content_change_still_detected(self):
+        """A genuine field change (url differs) must still be reported."""
+        baseline = _blocking_profile()
+        baseline["whitelistReference"] = {"items": [dict(self._WHITELIST_BASELINE)]}
+
+        changed = dict(self._WHITELIST_TARGET)
+        changed["url"] = "/different-path.png"  # genuine change
+        target = _blocking_profile()
+        target["whitelistReference"] = {"items": [changed]}
+
+        result = score_bot_profile(
+            target=target,
+            baseline=baseline,
+            vs_list=_vs_list(),
+            profile_meta=_meta(),
+        )
+        drift_findings = [
+            d for d in result.diffs
+            if d.section == "bot-defense.overrides.whitelist"
+            and d.attribute == "content"
+        ]
+        assert drift_findings, "Changed url field must produce a drift finding"

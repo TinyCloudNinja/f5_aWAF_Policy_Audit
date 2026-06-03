@@ -516,7 +516,7 @@ def _cmp_overrides(baseline: Dict, target: Dict, result: ComparisonResult) -> No
                 result.missing_in_target.append({"section": f"bot-defense.overrides.{inline_key}", "name": key})
                 continue
 
-            if b_entry != t_entry:
+            if _canonical_override_entry(b_entry) != _canonical_override_entry(t_entry):
                 display_rows.append({"collection": label, "name": key, "baseline_entry": b_entry, "target_entry": t_entry, "baseline_match": "diff"})
                 _add(result, DiffItem(
                     section=f"bot-defense.overrides.{inline_key}",
@@ -551,6 +551,28 @@ def _get_reference_subcollection(profile: Dict, ref_key: str, inline_key: str) -
         return ref.get("items", [])
     inline = profile.get(inline_key, [])
     return inline if isinstance(inline, list) else []
+
+
+# F5 iControl REST API metadata fields that are present on every subcollection
+# item but carry no security-configuration meaning.  They always differ between
+# profiles (generation is a per-object revision counter; selfLink embeds the
+# profile name in the URL) so they must be stripped before semantic comparison.
+_OVERRIDE_NOISE_KEYS: frozenset = frozenset({
+    "generation",
+    "selfLink",
+    "kind",
+    "lastUpdateMicros",
+})
+
+
+def _canonical_override_entry(entry: Dict) -> Dict:
+    """Return a copy of an override entry with API noise fields removed.
+
+    Strips generation, selfLink, kind, and lastUpdateMicros so that two
+    entries that are semantically identical but fetched from different profiles
+    (which always differ in generation and selfLink) compare as equal.
+    """
+    return {k: v for k, v in entry.items() if k not in _OVERRIDE_NOISE_KEYS}
 
 
 def _override_entry_key(entry: Dict) -> str:
