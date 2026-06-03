@@ -30,7 +30,8 @@ from .policy_inspector import PolicyInspector, print_inspection_table
 from .policy_fetcher import PolicyFetcher
 from .policy_comparator import compare_policies
 from .bot_defense_auditor import BotDefenseAuditor
-from .bot_defense_comparator import compare_bot_profiles
+from .bot_defense_comparator import compare_bot_profiles  # kept for backward compat
+from .bot_defense_scorer import score_bot_profile
 from .report_generator import (
     generate_html_dashboard,
     generate_markdown,
@@ -999,20 +1000,20 @@ def _run_bot_audit(
         full_path = profile_meta.get("fullPath", "")
         logger.info("Auditing Bot Defense profile %d/%d: %s", idx, total, full_path)
         try:
-            cmp_result = compare_bot_profiles(
-                baseline=baseline_data,
+            cmp_result = score_bot_profile(
                 target=profile_data,
+                baseline=baseline_data,
+                vs_list=profile_meta.get("virtual_servers", []),
                 profile_meta=profile_meta,
                 baseline_name=baseline_name,
                 device_hostname=device_hostname,
                 device_mgmt_ip=device_mgmt_ip,
-                virtual_servers=profile_meta.get("virtual_servers", []),
                 green_threshold=pass_threshold,
             )
         except Exception as exc:
-            logger.error("Failed to compare Bot Defense profile %s: %s", full_path, exc)
+            logger.error("Failed to score Bot Defense profile %s: %s", full_path, exc)
             short = full_path if len(full_path) <= 47 else "…" + full_path[-46:]
-            print(f"  [{idx}/{total}] {short}  COMPARE FAILED")
+            print(f"  [{idx}/{total}] {short}  SCORING ERROR")
             continue
 
         all_results.append(cmp_result)
@@ -1029,14 +1030,14 @@ def _run_bot_audit(
             sot_baseline, sot_name = gitlab_state.load_bot_source_of_truth(profile_meta["fullPath"])
             if sot_baseline is not None:
                 try:
-                    sot_cmp_result = compare_bot_profiles(
-                        baseline=sot_baseline,
+                    sot_cmp_result = score_bot_profile(
                         target=profile_data,
+                        baseline=sot_baseline,
+                        vs_list=profile_meta.get("virtual_servers", []),
                         profile_meta=profile_meta,
                         baseline_name=sot_name,
                         device_hostname=device_hostname,
                         device_mgmt_ip=device_mgmt_ip,
-                        virtual_servers=profile_meta.get("virtual_servers", []),
                         green_threshold=pass_threshold,
                     )
                     sot_results.append(sot_cmp_result)
