@@ -1,6 +1,12 @@
-"""Tests for WAF/Bot enforcement summary table rendering in HTML dashboard."""
+"""Tests for WAF/Bot enforcement summary table rendering in HTML dashboard.
+
+VS / destination data is sourced from ComparisonResult.virtual_servers,
+which is populated by PolicyExporter.enrich_with_virtual_servers() via the
+ASM API (virtualServers + manualVirtualServers fields).
+"""
 
 import re
+from typing import List, Optional
 
 from src.policy_comparator import ComparisonResult
 from src.report_generator import generate_html_dashboard
@@ -11,7 +17,25 @@ from src.virtual_server_inventory import (
 )
 
 
-def _make_result(policy_path: str, score: float = 95.0) -> ComparisonResult:
+def _vs(full_path: str, destination: str, assoc_type: str = "direct") -> dict:
+    """Minimal VS detail dict matching PolicyExporter._get_vs_destination output."""
+    name = full_path.split("/")[-1]
+    return {
+        "name": name,
+        "fullPath": full_path,
+        "destination": destination,
+        "ip": destination.split(":")[-2].lstrip("/").split("/")[-1] if ":" in destination else "",
+        "port": destination.split(":")[-1] if ":" in destination else "",
+        "association_type": assoc_type,
+        "ltm_policies": [],
+    }
+
+
+def _make_result(
+    policy_path: str,
+    score: float = 95.0,
+    virtual_servers: Optional[List[dict]] = None,
+) -> ComparisonResult:
     return ComparisonResult(
         policy_name=policy_path.split("/")[-1],
         policy_path=policy_path,
@@ -23,12 +47,26 @@ def _make_result(policy_path: str, score: float = 95.0) -> ComparisonResult:
         tier_label="Compliant" if score >= 90 else "Needs Review",
         device_hostname="bigip1.example.local",
         device_mgmt_ip="10.0.0.1",
+        virtual_servers=virtual_servers or [],
+        virtual_server_eval_performed=(virtual_servers is not None),
     )
 
 
 def test_generate_html_dashboard_includes_three_pane_landmarks_and_vs_summary(tmp_path):
-    results = [_make_result("/Common/api_waf", 96.0), _make_result("/Common/direct_waf", 88.0)]
+    results = [
+        _make_result(
+            "/Common/api_waf",
+            96.0,
+            virtual_servers=[_vs("/Common/vs_ltm", "/Common/10.0.0.12:443", "manual")],
+        ),
+        _make_result(
+            "/Common/direct_waf",
+            88.0,
+            virtual_servers=[_vs("/Common/vs_direct", "/Common/10.0.0.11:443", "direct")],
+        ),
+    ]
 
+    # Inventory is still accepted (for backward compat) but no longer drives the table.
     inventory = [
         VirtualServerRecord(
             name="vs_no_http",
@@ -103,7 +141,7 @@ def test_generate_html_dashboard_includes_three_pane_landmarks_and_vs_summary(tm
     assert "Tier Status" in html
     assert "Destination IP" in html
 
-    # Removed columns are gone from the summary table
+    # Removed columns are gone from the summary table header
     assert "data-col='partition'" not in html
     assert "data-col='http_profile'" not in html
     assert "data-col='status'" not in html
@@ -118,17 +156,17 @@ def test_generate_html_dashboard_includes_three_pane_landmarks_and_vs_summary(tm
     # Summary bar (tier count pills) is gone
     assert "class='summary-bar'" not in html
 
-    # Policy rows present — direct attachment
+    # Policy rows driven by ComparisonResult.virtual_servers — direct attachment
     assert "/Common/direct_waf" in html
     assert "/Common/vs_direct" in html
     assert "/Common/10.0.0.11:443" in html
 
-    # Policy rows present — LTM-policy-routed attachment
+    # Policy rows — LTM/manual attachment
     assert "/Common/api_waf" in html
     assert "/Common/vs_ltm" in html
     assert "/Common/10.0.0.12:443" in html
 
-    # VSes with no policies (vs_no_http, vs_capable) do not appear as rows
+    # VSes that appear only in inventory (not in any result.virtual_servers) are absent
     assert "vs_no_http" not in html
     assert "vs_capable" not in html
 
@@ -148,8 +186,8 @@ def test_generate_html_dashboard_includes_three_pane_landmarks_and_vs_summary(tm
 
 
 def test_policy_without_vs_shows_not_applied(tmp_path):
-    """Policies in results that have no VS in the inventory get a 'Not applied' row."""
-    results = [_make_result("/Common/orphan_policy", 70.0)]
+    """Policies whose virtual_servers list is empty get a 'Not applied' row."""
+    results = [_make_result("/Common/orphan_policy", 70.0, virtual_servers=[])]
     out = generate_html_dashboard(results, str(tmp_path), virtual_server_inventory=[])
     html = out.read_text(encoding="utf-8")
 
@@ -157,9 +195,15 @@ def test_policy_without_vs_shows_not_applied(tmp_path):
     assert "Not applied" in html
 
 
-def test_inventory_error_shows_banner(tmp_path):
-    """When inventory collection failed, an error banner appears instead of the table."""
-    results = [_make_result("/Common/some_policy", 80.0)]
+def test_inventory_error_does_not_block_table(tmp_path):
+    """An inventory_error no longer blocks the table; the result's VS data still renders."""
+    results = [
+        _make_result(
+            "/Common/some_policy",
+            80.0,
+            virtual_servers=[_vs("/Common/vs_one", "/Common/192.0.2.1:443")],
+        )
+    ]
     out = generate_html_dashboard(
         results,
         str(tmp_path),
@@ -167,50 +211,49 @@ def test_inventory_error_shows_banner(tmp_path):
         virtual_server_inventory_error="Connection timed out",
     )
     html = out.read_text(encoding="utf-8")
-    assert "Connection timed out" in html
-    assert "pb-disabled" in html
+    # Table still renders with VS data from ComparisonResult
+    assert "/Common/vs_one" in html
+    assert "/Common/192.0.2.1:443" in html
 
 
-def test_multiple_ltm_policies_same_vs_each_get_row(tmp_path):
-    """Two WAF policies routed via different LTM rules on the same VS each get their own row."""
+def test_multiple_vs_per_policy_each_get_row(tmp_path):
+    """A policy attached to two VSes emits two rows, one per VS."""
     results = [
-        _make_result("/Common/waf_a", 95.0),
-        _make_result("/Common/waf_b", 85.0),
-    ]
-    inventory = [
-        VirtualServerRecord(
-            name="vs_multi",
-            partition="Common",
-            full_path="/Common/vs_multi",
-            destination="/Common/10.0.0.20:443",
-            http_profile="/Common/http",
-            directly_attached_waf_policies=[],
-            ltm_policies=[
-                LtmPolicyAttachment(
-                    name="ltm_multi",
-                    full_path="/Common/ltm_multi",
-                    rules=[
-                        LtmPolicyRuleAttachment(
-                            rule_name="rule_a",
-                            host_conditions=["a.example.com"],
-                            waf_policy="/Common/waf_a",
-                        ),
-                        LtmPolicyRuleAttachment(
-                            rule_name="rule_b",
-                            host_conditions=["b.example.com"],
-                            waf_policy="/Common/waf_b",
-                        ),
-                    ],
-                )
+        _make_result(
+            "/Common/shared_waf",
+            95.0,
+            virtual_servers=[
+                _vs("/Common/vs_a", "/Common/10.0.0.30:443"),
+                _vs("/Common/vs_b", "/Common/10.0.0.31:443"),
             ],
-            waf_status="enabled",
         )
     ]
-    out = generate_html_dashboard(results, str(tmp_path), virtual_server_inventory=inventory)
+    out = generate_html_dashboard(results, str(tmp_path), virtual_server_inventory=[])
+    html = out.read_text(encoding="utf-8")
+
+    assert "/Common/vs_a" in html
+    assert "/Common/vs_b" in html
+    assert html.count("/Common/shared_waf") >= 2
+
+
+def test_multiple_policies_same_vs_each_get_row(tmp_path):
+    """Two policies attached to the same VS each appear as their own row."""
+    results = [
+        _make_result(
+            "/Common/waf_a",
+            95.0,
+            virtual_servers=[_vs("/Common/vs_multi", "/Common/10.0.0.20:443")],
+        ),
+        _make_result(
+            "/Common/waf_b",
+            85.0,
+            virtual_servers=[_vs("/Common/vs_multi", "/Common/10.0.0.20:443")],
+        ),
+    ]
+    out = generate_html_dashboard(results, str(tmp_path), virtual_server_inventory=[])
     html = out.read_text(encoding="utf-8")
 
     assert "/Common/waf_a" in html
     assert "/Common/waf_b" in html
-    # Both rows reference the same VS and destination
     assert html.count("/Common/vs_multi") >= 2
     assert html.count("/Common/10.0.0.20:443") >= 2

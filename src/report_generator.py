@@ -530,22 +530,12 @@ def _build_enforcement_summary_section(
 ) -> str:
     """Build the single consolidated WAF/Bot enforcement table for the Summary tab.
 
-    One row per policy-VS pairing.  Direct attachments and LTM-policy-routed
-    attachments are both expanded into individual rows.  Policies not bound to
-    any VS in the inventory appear with VS = "Not applied" / Destination = "—".
+    Data source: ComparisonResult.virtual_servers, populated by
+    PolicyExporter.enrich_with_virtual_servers() from the ASM API's
+    virtualServers (direct) and manualVirtualServers (LTM-routed) fields.
+    One row per policy-VS pairing; policies with no VS binding get
+    "Not applied" / "—" placeholders.
     """
-    if inventory_error:
-        return (
-            "<div class='pb-banner pb-disabled' role='alert'>"
-            "<span class='g'>&#9888;</span>"
-            "<span>Virtual server inventory was unavailable for this run. "
-            f"Details: {_esc(inventory_error)}</span>"
-            "</div>"
-        )
-
-    result_by_path: Dict[str, ComparisonResult] = {
-        str(r.policy_path): r for r in (results or [])
-    }
 
     def _mode_badge(mode: Optional[str]) -> tuple[str, str]:
         if not mode:
@@ -555,18 +545,14 @@ def _build_enforcement_summary_section(
             return ("<span class='pill mode-blocking'>Blocking</span>", "blocking")
         return ("<span class='pill mode-transparent'>Transparent</span>", "transparent")
 
-    seen: set = set()
     rows: List[str] = []
 
-    def _add_row(policy_path: str, vs_display: str, destination: str) -> None:
-        res = result_by_path.get(policy_path)
-        mode_html, mode_sort = _mode_badge(res.enforcement_mode if res else None)
-        tier_display = (
-            f"{_TIER_EMOJI.get(res.tier, '')} {res.tier_label}".strip()
-            if res else "—"
-        )
-        tier_sort = res.tier_label if res else ""
-        tier_cls = _TIER_CLASS.get(res.tier, "") if res else ""
+    def _add_row(r: ComparisonResult, vs_display: str, destination: str) -> None:
+        policy_path = str(r.policy_path)
+        mode_html, mode_sort = _mode_badge(r.enforcement_mode)
+        tier_display = f"{_TIER_EMOJI.get(r.tier, '')} {r.tier_label}".strip()
+        tier_sort = r.tier_label
+        tier_cls = _TIER_CLASS.get(r.tier, "")
 
         if policy_path in policy_path_to_id:
             pol_cell = (
@@ -596,41 +582,18 @@ def _build_enforcement_summary_section(
             "</tr>"
         )
 
-    for rec in (virtual_server_inventory or []):
-        source: Any = asdict(rec) if is_dataclass(rec) else rec
-        if not isinstance(source, dict):
-            continue
-
-        vs_display = str(source.get("full_path") or source.get("name") or "—")
-        destination = str(source.get("destination") or "—")
-        direct = list(source.get("directly_attached_waf_policies") or [])
-        ltm_list = list(source.get("ltm_policies") or [])
-
-        for pol in direct:
-            p = str(pol)
-            key = (p, vs_display)
-            if key not in seen:
-                seen.add(key)
-                _add_row(p, vs_display, destination)
-
-        for ltm_pol in ltm_list:
-            if not isinstance(ltm_pol, dict):
-                continue
-            for rule in (ltm_pol.get("rules") or []):
-                if not isinstance(rule, dict):
-                    continue
-                waf_policy = str(rule.get("waf_policy") or "")
-                if not waf_policy:
-                    continue
-                key = (waf_policy, vs_display)
-                if key not in seen:
-                    seen.add(key)
-                    _add_row(waf_policy, vs_display, destination)
-
-    seen_policies = {p for (p, _) in seen}
     for r in (results or []):
-        if str(r.policy_path) not in seen_policies:
-            _add_row(str(r.policy_path), "Not applied", "—")
+        vs_list = list(getattr(r, "virtual_servers", None) or [])
+        if vs_list:
+            for vs in vs_list:
+                vs_display = str(vs.get("fullPath") or vs.get("name") or "—")
+                destination = str(vs.get("destination") or "")
+                if not destination and vs.get("ip"):
+                    port = vs.get("port", "")
+                    destination = f"{vs['ip']}:{port}" if port else str(vs["ip"])
+                _add_row(r, vs_display, destination or "—")
+        else:
+            _add_row(r, "Not applied", "—")
 
     no_data = "<tr><td colspan='5' class='muted'>No WAF or Bot policies found.</td></tr>"
     return (
