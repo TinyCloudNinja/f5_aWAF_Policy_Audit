@@ -177,21 +177,6 @@ BOT_SCORING_CONFIG: dict = {
 
         # ── Lower-weight: permissive hygiene ───────────────────────────────────
 
-        "cross_domain_permissive": {
-            "label": "Cross-domain requests set to allow-all",
-            "description": (
-                "crossDomainRequests is permissive (allow-all) rather than "
-                "validating origin domains. Cross-origin automation is not "
-                "challenged or restricted."
-            ),
-            "remediation": (
-                "Set crossDomainRequests to validate or restrict origins not in "
-                "the site-domains list to prevent cross-origin bot abuse."
-            ),
-            "flat": 5,
-            "max_deduction": 5,
-        },
-
         "mobile_sdk_loose": {
             "label": "Mobile SDK security posture loosened",
             "description": (

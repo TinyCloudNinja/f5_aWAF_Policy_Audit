@@ -189,7 +189,6 @@ def _cmp_core(baseline: Dict, target: Dict, result: ComparisonResult) -> None:
         ("apiAccessStrictMitigation", Severity.WARNING.value, "API access strict mitigation differs from baseline."),
         ("dosAttackStrictMitigation", Severity.WARNING.value, "DoS attack strict mitigation differs from baseline."),
         ("signatureStagingUponUpdate", Severity.WARNING.value, "Signature staging upon update differs."),
-        ("crossDomainRequests", Severity.WARNING.value, "Cross-domain requests setting differs."),
     ]:
         b_val = baseline.get(attr)
         t_val = target.get(attr)
@@ -229,7 +228,7 @@ def _cmp_core(baseline: Dict, target: Dict, result: ComparisonResult) -> None:
     tracked = [
         "enforcementMode", "template", "browserMitigationAction",
         "allowBrowserAccess", "apiAccessStrictMitigation", "dosAttackStrictMitigation",
-        "signatureStagingUponUpdate", "crossDomainRequests",
+        "signatureStagingUponUpdate",
         "performChallengeInTransparent", "singlePageApplication", "deviceidMode",
         "gracePeriod", "enforcementReadinessPeriod",
     ]

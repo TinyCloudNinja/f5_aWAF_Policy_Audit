@@ -279,14 +279,6 @@ def _compute_bot_posture_score(
             f"{staged_count} bot signature(s) are in staging (log-only) mode.",
         )
 
-    # Cross-domain permissive (lower weight)
-    if _detect_cross_domain_permissive(target):
-        _add_signal(
-            "cross_domain_permissive",
-            float(cats["cross_domain_permissive"]["flat"]),
-            cats["cross_domain_permissive"]["description"],
-        )
-
     # Mobile SDK loose flags (lower weight, per-flag)
     loose_flags = _detect_mobile_sdk_loose(target)
     if loose_flags:
@@ -456,12 +448,6 @@ def _detect_staged_signatures(target: Dict) -> int:
     return len(staged)
 
 
-def _detect_cross_domain_permissive(target: Dict) -> bool:
-    """True when crossDomainRequests is set to allow-all."""
-    cdr = str(target.get("crossDomainRequests", "")).lower().replace("-", "").replace("_", "")
-    return cdr in ("allowall",)
-
-
 def _detect_mobile_sdk_loose(target: Dict) -> List[str]:
     """Return a list of human-readable descriptions for each loose mobile SDK flag."""
     mobile = target.get("mobileDetection") or {}
@@ -547,12 +533,6 @@ def _is_loosening_bot_diff(diff: DiffItem) -> bool:
     # Strict mitigation flags turned off
     if attr in ("dosAttackStrictMitigation", "apiAccessStrictMitigation"):
         return b_val is True and t_val is False
-
-    # Cross-domain restrictions loosened
-    if attr == "crossDomainRequests":
-        t_norm = str(t_val).lower().replace("-", "").replace("_", "")
-        b_norm = str(b_val).lower().replace("-", "").replace("_", "")
-        return t_norm == "allowall" and b_norm != "allowall"
 
     # Override collection content change (_cmp_overrides emits attribute="content"
     # with the full entry dict as values).  For class overrides, check whether the
