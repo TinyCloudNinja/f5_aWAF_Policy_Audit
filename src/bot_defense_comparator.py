@@ -40,7 +40,6 @@ _OVERRIDE_COLLECTIONS = [
     ("microServicesReference", "microServices", "Micro Services"),
     ("signatureCategoryOverridesReference", "signatureCategoryOverrides", "Signature Category Overrides"),
     ("signatureOverridesReference", "signatureOverrides", "Signature Overrides"),
-    ("siteDomainsReference", "siteDomains", "Site Domains"),
     ("stagedSignaturesReference", "stagedSignatures", "Staged Signatures"),
     ("whitelistReference", "whitelist", "Whitelist"),
 ]
