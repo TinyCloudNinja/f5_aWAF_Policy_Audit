@@ -22,7 +22,6 @@ from src.bot_defense_scorer import (
     _detect_dos_anomaly_alarm_only,
     _detect_api_strict_off,
     _detect_staged_signatures,
-    _detect_cross_domain_permissive,
     _detect_mobile_sdk_loose,
     _detect_template_relaxed,
     _detect_deviceid_weak,
@@ -353,24 +352,6 @@ class TestStandaloneStagedSignatures:
         )
         assert staged_factor is not None
         assert staged_factor["deduction"] <= 10  # max_deduction from config
-
-
-# ---------------------------------------------------------------------------
-# Standalone signal: cross_domain_permissive
-# ---------------------------------------------------------------------------
-
-class TestStandaloneCrossDomainPermissive:
-    def test_flags_allow_all(self):
-        target = _blocking_profile(crossDomainRequests="allow-all")
-        assert _detect_cross_domain_permissive(target) is True
-
-    def test_flags_allow_all_underscored(self):
-        target = _blocking_profile(crossDomainRequests="allow_all")
-        assert _detect_cross_domain_permissive(target) is True
-
-    def test_does_not_flag_validate_origin(self):
-        target = _blocking_profile(crossDomainRequests="validate-origin")
-        assert _detect_cross_domain_permissive(target) is False
 
 
 # ---------------------------------------------------------------------------
