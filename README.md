@@ -171,8 +171,8 @@ and learning mode for every policy. Useful for quick device state snapshots.
 |----------|---------|---------|-------------|
 | `--output-dir` | `OUTPUT_DIR` | `../<repo_name>_output` | Output directory for reports and logs |
 | `--format` | `REPORT_FORMAT` | `both` | `html` = interactive dashboard only, `markdown` = per-policy reports + summary, `both` = dashboard + markdown |
-| `--pass-threshold` | `PASS_THRESHOLD` | `90.0` | Green tier lower bound. Only shifts the Yellow/Green boundary; other bands remain fixed. |
-| `--fail-on-tier` | `FAIL_ON_TIER` | `RED` | Tier that triggers a non-zero exit code (RED/AMBER/YELLOW/GREEN). |
+| `--pass-threshold` | `PASS_THRESHOLD` | `85.0` | Aligned (Green) band lower bound. Only shifts the Monitor/Aligned boundary; other bands remain fixed. |
+| `--fail-on-tier` | `FAIL_ON_TIER` | `RED` | Tier that triggers a non-zero exit code (RED/AMBER/YELLOW/GREEN = Review Now / Review Soon / Monitor / Aligned). |
 | `-v` / `--verbose` | — | `false` | Enable debug logging |
 | `--config` | — | `config.yaml` | Path to YAML config file |
 
@@ -266,30 +266,169 @@ Legacy XML files are still read as a fallback; re-run with
 
 ---
 
-## Compliance Scoring
+## Posture Scoring
 
-Each policy starts at a score of **100.0**. Findings deduct points by severity:
+WAF mode and Bot Defense mode share one scoring framework — the **Posture
+Score** — but each mode has its own rules, weights, and detectors:
 
-| Severity | Deduction | Condition |
-|----------|-----------|-----------|
-| **Critical** | −5.0 | Protection **enabled in baseline** is **disabled in target** |
-| **High** | −3.0 | Notable security posture regression not reaching Critical threshold |
-| **Warning** | −2.0 | Configuration drift that reduces security posture |
-| **Info** | −0.5 | Informational differences (e.g., baseline whitelist IPs absent in target) |
+- **WAF**: `src/scoring_config.py` (config) + `_compute_posture_score()` in
+  `src/policy_comparator.py` (engine)
+- **Bot Defense**: `src/bot_defense_scoring_config.py` (config) +
+  `src/bot_defense_scorer.py` (engine)
 
-Score is floored at **0.0** and displayed with one decimal place.
+All weights, caps, and thresholds live in the two config files, so scoring can
+be tuned without touching logic code.
 
-### Compliance Tiers
+### The Algorithm (both modes)
 
-| Tier | Score Range | Meaning |
-|------|-------------|---------|
-| 🔴 **RED** | 0 – 49 | Non-Compliant — significant security gaps |
-| 🟠 **AMBER** | 50 – 74 | Review Required — material drift identified |
-| 🟡 **YELLOW** | 75 – 89 | Monitor — minor drift; schedule remediation |
-| 🟢 **GREEN** | 90 – 100 | Compliant — within acceptable deviation |
+Every policy/profile starts at **100.0** and the engine works through four
+stages:
 
-The Green lower bound defaults to 90 and can be adjusted with `--pass-threshold`.
-Use `--fail-on-tier` to set the tier that triggers a non-zero exit code (default: RED).
+1. **Hard triggers** — a small set of conditions so severe that they override
+   the numeric score entirely. If *any* hard trigger fires, the final score is
+   capped at **39**, pinning the item into the 🔴 **Review Now** band no matter
+   how clean the rest of the configuration is.
+2. **Drift deductions** — DiffItems from the baseline comparison are classified
+   as *loosening* (security got weaker) or *tightening* (security got stronger).
+   **Only loosening drift deducts points**; tightening changes are listed in the
+   drift summary but cost nothing. Each loosening diff deducts by severity, and
+   each drift *category* has a maximum cap so one noisy category (e.g. hundreds
+   of signature diffs) cannot single-handedly zero the score.
+3. **Standalone posture signals** — risk indicators computed directly from the
+   target configuration with **no baseline required** (e.g. signatures stuck in
+   staging, permissive mobile SDK flags). Each signal has its own independent
+   cap.
+4. **Final score** —
+   `raw_score = max(0, 100 − (capped drift total + standalone total))`,
+   then `final_score = min(raw_score, 39)` if any hard trigger fired.
+   The raw (pre-cap) score is retained and shown alongside the final score.
+
+Every deduction is recorded as a **contributing factor** (ranked
+largest-first in the reports) with a label, description, and remediation text
+taken from the scoring config.
+
+**Severity weights for loosening drift (both modes):**
+
+| Severity | Deduction per finding |
+|----------|----------------------|
+| Critical | −8.0 |
+| High | −4.0 |
+| Warning | −2.0 |
+| Info | −0.5 |
+
+### Triage Bands
+
+Both modes map the final score onto the same four-band status ladder
+(internal tier names `RED`/`AMBER`/`YELLOW`/`GREEN` are kept for CLI/exit-code
+compatibility):
+
+| Band | Internal Tier | Score Range | Meaning |
+|------|---------------|-------------|---------|
+| 🔴 **Review Now** | RED | 0 – 39 | Hard trigger fired or severe posture gaps — act immediately |
+| 🟠 **Review Soon** | AMBER | 40 – 64 | Material drift or weak posture — schedule review |
+| 🟡 **Monitor** | YELLOW | 65 – 84 | Minor drift; keep an eye on it |
+| 🟢 **Aligned** | GREEN | 85 – 100 | Within acceptable deviation from baseline |
+
+The Aligned lower bound defaults to **85** and can be moved with
+`--pass-threshold`; only the Monitor/Aligned boundary shifts — the Review
+Now/Review Soon boundaries stay fixed at 39/64. Use `--fail-on-tier` to choose
+which tier produces a non-zero exit code (default: `RED`).
+
+### WAF Scoring Details
+
+**Hard triggers** (any one pins the policy to Review Now):
+
+| Trigger | Condition |
+|---------|-----------|
+| `TRANSPARENT_MODE` | Enforcement mode is not `blocking` — the policy logs violations but blocks nothing |
+| `NO_VIRTUAL_SERVERS` | VS mapping was evaluated and the policy is not bound to any virtual server — it enforces nothing |
+| `NO_SIGNATURE_SETS` | No attack signature sets are applied — no pattern-matching coverage at all |
+
+**Drift category caps** (maximum deduction per category of loosening diffs):
+
+| Category | Cap | Typical findings |
+|----------|-----|------------------|
+| `signatures` | 20 | Signatures disabled, sets removed or un-blocked |
+| `blocking` | 20 | Violation block → alarm downgrades |
+| `data_guard` | 16 | Data Guard features disabled |
+| `ip_intelligence` | 12 | IP intelligence disabled / categories relaxed |
+| `bot_defense` | 12 | Embedded bot defense settings disabled |
+| `policy_builder` | 10 | Policy Builder loosened vs baseline |
+| `whitelist` | 8 | Unauthorized IP whitelist additions |
+| `general` | 8 | General settings |
+| `enforcement` | 0 | Mode change is already a hard trigger — no double-count |
+| *(default)* | 6 | Any unlisted category |
+
+A diff counts as *loosening* when, for example: a `block` flag goes
+`true → false`, a signature gains `performStaging`, an `enabled` flag goes
+`true → false`, enforcement goes `blocking → transparent`, or an entity/set
+present in the baseline is missing from the target.
+
+**Standalone posture signals** (no baseline needed):
+
+| Signal | Deduction | What it detects |
+|--------|-----------|-----------------|
+| Staging ratio | tiered, max −20 | Share of attack signatures in staging (log-only): ≥75% → −20, ≥50% → −14, ≥25% → −8, ≥10% → −3 |
+| All blocking disabled | flat −15 | Policy is in blocking mode but every violation/signature block flag is off |
+| Policy Builder fully automatic | flat −10 | Auto-learning can be poisoned: shaped traffic can train the WAF to accept real attacks |
+| Accepted learning widened policy | −3/item, max −12 | Accepted Policy Builder suggestions in the ASM audit log that staged/disabled signatures, relaxed violations, or widened entities |
+| Loose wildcard entities | −2/item, max −8 | Wildcard URLs/parameters (`*`, `/*`, …) with attack-signature checks disabled |
+
+### Bot Defense Scoring Details
+
+The Bot Defense threat model differs from WAF: the analog of Policy Builder
+poisoning is **allow-listing and class-action downgrading** — whitelist growth
+and mitigation actions weakened from block → alarm/none are the primary drift
+signals. "Blocking actions" for bot scoring are `block`, `captcha`, and
+`rate-limit`; `alarm` and `none` are detection-only.
+
+**Hard triggers** (any one pins the profile to Review Now):
+
+| Trigger | Condition |
+|---------|-----------|
+| `NO_VIRTUAL_SERVERS` | VS mapping was evaluated and the profile is attached to no virtual server |
+| `BOT_TRANSPARENT_MODE` | `enforcementMode` is not `blocking` — bots are logged, never blocked or challenged |
+| `BOT_NO_TEETH` | Class overrides exist for high-risk bot classes (`malicious-bot`, `dos-tool`, `web-scraper`, `scanner`, `vulnerability-scanner`, `network-scanner`, `denial-of-service`) and **every one** of them uses a non-blocking action — the profile detects malicious bots but mitigates none of them |
+
+**Drift category caps:**
+
+| Category | Cap | Typical findings |
+|----------|-----|------------------|
+| `class_actions` | 20 | Class override action downgrades — the primary poisoning vector |
+| `whitelist` | 16 | Whitelist entries added / IP ranges broadened |
+| `bot_defense` | 12 | Core enforcement/mode/mitigation settings |
+| `mobile_sdk` | 8 | Mobile SDK posture loosened vs baseline |
+| `signatures` | 8 | Signatures moved to staging / actions weakened |
+| `general` | 6 | Other settings |
+| *(default)* | 4 | Any unlisted category |
+
+A bot diff counts as *loosening* when, for example: an override `action` goes
+from a blocking action to a non-blocking one, a whitelist entry appears that
+wasn't in the baseline, the template drops down the
+`strict > balanced > relaxed` ladder, a permissive mobile SDK flag turns on, or
+`dosAttackStrictMitigation`/`apiAccessStrictMitigation` turns off.
+
+**Standalone posture signals:**
+
+| Signal | Deduction | What it detects |
+|--------|-----------|-----------------|
+| Browser mitigation weak | flat −12 | `browserMitigationAction` set to a non-blocking value — untrusted browsers logged but never challenged |
+| DoS/anomaly alarm-only | flat −10 | `dosAttackStrictMitigation` disabled, or every configured anomaly override is detect-only |
+| API strict mitigation off | flat −8 | `apiAccessStrictMitigation` explicitly disabled |
+| Staged bot signatures | −1/signature, max −10 | Bot signatures accumulating in staging (log-only) |
+| Mobile SDK loose | −2/flag, max −8 | Jailbroken/rooted devices allowed, emulators allowed, any Android/iOS package allowed, debugger-enabled devices not blocked |
+| Relaxed template | flat −4 | Profile uses the `relaxed` template (least restrictive) |
+| Weak device ID | flat −4 | `deviceidMode` disabled/weak — no persistent device fingerprinting |
+| Extended grace period | flat −3 | `gracePeriod` or `enforcementReadinessPeriod` > 86 400 s (1 day) |
+| Challenge-in-transparent off | flat −2 | `performChallengeInTransparent` disabled — reduces detection fidelity |
+
+### Scoring Without a Baseline
+
+When no baseline is available (no BST-prefixed policy/profile selected and no
+Git source-of-truth file), **drift deductions are suppressed entirely** — the
+score reflects standalone posture signals only. The report adds a
+zero-deduction *"Drift tracking is unbaselined"* note so the gap is visible
+rather than silently inflating the score.
 
 ### Exit Codes
 
